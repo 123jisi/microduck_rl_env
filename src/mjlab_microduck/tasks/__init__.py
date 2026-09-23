@@ -75,6 +75,10 @@ from .microduck_roulade_env_cfg import (
     make_microduck_roulade_env_cfg,
     MicroduckRouladeRlCfg,
 )
+from .microduck_backflip_env_cfg import (
+    make_microduck_backflip_env_cfg,
+    MicroduckBackFlipRlCfg,
+)
 from .backlash import make_backlash_variant
 
 # Standard velocity task
@@ -230,6 +234,16 @@ register_mjlab_task(
     env_cfg=make_microduck_roulade_env_cfg(),
     play_env_cfg=make_microduck_roulade_env_cfg(play=True),
     rl_cfg=MicroduckRouladeRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Back flip — backward roll over the flat head top, land back on the feet.
+# Same recipe as the roulade, rotation sign flipped (see mdp.py backflip_*).
+register_mjlab_task(
+    task_id="Mjlab-BackFlip-Flat-MicroDuck",
+    env_cfg=make_microduck_backflip_env_cfg(),
+    play_env_cfg=make_microduck_backflip_env_cfg(play=True),
+    rl_cfg=MicroduckBackFlipRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 

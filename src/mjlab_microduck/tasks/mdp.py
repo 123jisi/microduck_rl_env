@@ -7186,3 +7186,462 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+# ==============================================================================
+# Back flip (backward roll) task — episodic dynamic maneuver
+# ==============================================================================
+#
+# Mirrored on the roulade (forward roll) design, which is the proven recipe
+# after five runs of lesson arc (see the roulade section above). The two
+# motions differ in ONE load-bearing way: the rotation direction.
+#
+# Sign convention (verified against set_random_ground_state / the roulade
+# smoke test): face-down = +90° pitch = POSITIVE rotation about body +y, so
+# a FORWARD roll integrates POSITIVE ω_y and a BACKWARD roll integrates
+# NEGATIVE ω_y. The roulade's accumulator multiplies body ω_y by
+# _ROULADE_FWD_SIGN = +1.0; the back-flip accumulator multiplies by -1.0 so
+# "progress" is again a monotone 0 → 2π frontier. Everything else —
+# support gate, head latch with top-down check, flatness gate, completion
+# gates, reverse-curriculum mid-roll spawns — is direction-agnostic and
+# reused verbatim with a _backflip_ state namespace so the two tasks can
+# even coexist in one process.
+#
+# Back-flip specific notes:
+#   • The head pivot is the SAME body contact (jaw_soft carries the flat head
+#     top in robot_allcollisions.xml); in a back flip the head plants just as
+#     in a roulade. The _head_top_down check is direction-agnostic (it tests
+#     geometry, not motion), so it is reused as-is.
+#   • Landing after a backward roll is over the BACK: the completion-gated
+#     landing stack (composite / upright / height / sharp / stand tax / rise
+#     velocity) is unchanged — it only reads the frontier, not the path.
+#   • Mid-roll reverse-curriculum spawns pitch the trunk BACKWARD
+#     (negative pitch) so the tucked configuration matches a backward roll.
+
+_BACKFLIP_FWD_SIGN = -1.0  # backward roll = NEGATIVE body-frame ω_y
+
+# Sensor names read by the accumulator update (must match the env cfg).
+_BACKFLIP_SUPPORT_SENSOR = "robot_ground_contact"
+_BACKFLIP_HEAD_SENSOR = "head_ground_contact"
+
+
+def _backflip_state(env: ManagerBasedRlEnv) -> tuple:
+    """Per-env back-flip progress state (lazily created, reset by reset)."""
+    if not hasattr(env, "_backflip_accum"):
+        z = torch.zeros(env.num_envs, device=env.device)
+        env._backflip_accum = z.clone()
+        env._backflip_max = z.clone()
+        env._backflip_paid = z.clone()
+        env._backflip_head_latch = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._backflip_last_update_step = -1
+    return env._backflip_accum, env._backflip_max, env._backflip_paid
+
+
+def _update_backflip_accum(env: ManagerBasedRlEnv, asset: Entity) -> None:
+    """Integrate BACKWARD pitch rate into the per-env rotation accumulator.
+
+    Identical structure to _update_roulade_accum, with the sign flipped
+    (_BACKFLIP_FWD_SIGN = -1.0) so backward rotation grows the frontier.
+    Step-guarded, support-gated, flatness-gated, and latches the head-top
+    contact exactly like the forward roll.
+    """
+    _backflip_state(env)
+    step = int(env.common_step_counter)
+    if step != env._backflip_last_update_step:
+        omega_fwd = _BACKFLIP_FWD_SIGN * asset.data.root_link_ang_vel_b[:, 1]
+        delta = torch.nan_to_num(omega_fwd, nan=0.0) * env.step_dt
+        supported = _sensor_any_contact(env, _BACKFLIP_SUPPORT_SENSOR)
+        if supported is not None:
+            delta = delta * supported.float()
+        # Sagittal flatness gate (same as roulade): side/shoulder rolls don't count.
+        y_z = torch.nan_to_num(_lateral_axis_z(asset.data.root_link_quat_w), nan=1.0).abs()
+        t = torch.clamp((_FLAT_ZERO - y_z) / (_FLAT_ZERO - _FLAT_FULL), 0.0, 1.0)
+        delta = delta * (t * t * (3.0 - 2.0 * t))
+        env._backflip_accum = env._backflip_accum + delta
+        env._backflip_max = torch.maximum(env._backflip_max, env._backflip_accum)
+
+        head_contact = _sensor_any_contact(env, _BACKFLIP_HEAD_SENSOR)
+        if head_contact is not None:
+            in_window = (env._backflip_accum > _HEAD_LATCH_LO) & (
+                env._backflip_accum < _HEAD_LATCH_HI
+            )
+            # Same direction-agnostic top-down latch as the roulade.
+            env._backflip_head_latch = env._backflip_head_latch | (
+                head_contact & in_window & _head_top_down(env, asset)
+            )
+        env._backflip_last_update_step = step
+
+
+def _backflip_completion_gate(
+    env: ManagerBasedRlEnv,
+    gate_lo: float,
+    gate_hi: float,
+    require_head: bool = False,
+) -> torch.Tensor:
+    """Smoothstep on the back-flip progress frontier (0 below lo, 1 above hi)."""
+    _, max_accum, _ = _backflip_state(env)
+    t = torch.clamp((max_accum - gate_lo) / max(gate_hi - gate_lo, 1e-6), 0.0, 1.0)
+    gate = t * t * (3.0 - 2.0 * t)
+    if require_head:
+        gate = gate * env._backflip_head_latch.float()
+    return gate
+
+
+def reset_backflip_state(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    standing_prob: float = 0.5,
+    midroll_prob: float = 0.5,
+    standing_z_min: float = 0.11,
+    standing_z_max: float = 0.12,
+    standing_tilt_max: float = 0.0,
+    backward_vel_range: tuple = (0.0, 0.0),
+    midroll_pitch_min: float = math.radians(50.0),
+    midroll_pitch_max: float = math.radians(185.0),
+    midroll_z_min: float = 0.05,
+    midroll_z_max: float = 0.10,
+    midroll_omega_range: tuple = (0.0, 0.0),
+    tuck_overrides: Optional[dict] = None,
+    tuck_factor_range: tuple = (0.3, 1.0),
+    joint_noise_std: float = 0.0,
+):
+    """Reset to a standing start or a mid-BACKWARD-roll state (reverse curriculum).
+
+    Same two-bucket spawn as reset_roulade_state, with the mid-roll bucket
+    pitched BACKWARD (negative pitch) and the spawn angular momentum about
+    body -y, so the tucked configuration matches a backward roll. The
+    accumulator is initialized to the spawn |pitch| so progress accounting
+    stays consistent (a 170° backward spawn only gets paid the remaining
+    ~190°).
+    """
+    if env_ids is None or len(env_ids) == 0:
+        return
+    env_ids = env_ids.to(env.device, dtype=torch.long)
+    num = len(env_ids)
+    asset: Entity = env.scene[asset_cfg.name]
+    accum, max_accum, paid = _backflip_state(env)
+
+    total = standing_prob + midroll_prob
+    is_mid = torch.rand(num, device=env.device) < (midroll_prob / max(total, 1e-6))
+
+    yaw = torch.rand(num, device=env.device) * 2 * np.pi - np.pi
+    cy = torch.cos(yaw * 0.5)
+    sy = torch.sin(yaw * 0.5)
+
+    # Pitch per bucket: small noise for standing, mid-backward-roll otherwise.
+    # NEGATIVE pitch = leaning backward (opposite of the roulade's mid-roll).
+    pitch = (torch.rand(num, device=env.device) * 2 - 1) * standing_tilt_max
+    mid_pitch_mag = (
+        torch.rand(num, device=env.device) * (midroll_pitch_max - midroll_pitch_min)
+        + midroll_pitch_min
+    )
+    pitch = torch.where(is_mid, -mid_pitch_mag, pitch)
+    roll = (torch.rand(num, device=env.device) * 2 - 1) * max(standing_tilt_max, math.radians(5.0))
+
+    cp = torch.cos(pitch * 0.5); sp = torch.sin(pitch * 0.5)
+    cr = torch.cos(roll * 0.5); sr = torch.sin(roll * 0.5)
+    # ZYX intrinsic Euler → quaternion (yaw * pitch * roll), as in
+    # set_random_ground_state / reset_roulade_state.
+    qw = cr * cp * cy + sr * sp * sy
+    qx = sr * cp * cy - cr * sp * sy
+    qy = cr * sp * cy + sr * cp * sy
+    qz = cr * cp * sy - sr * sp * cy
+    quat = torch.stack([qw, qx, qy, qz], dim=1)
+
+    z_stand = torch.rand(num, device=env.device) * (standing_z_max - standing_z_min) + standing_z_min
+    z_mid = torch.rand(num, device=env.device) * (midroll_z_max - midroll_z_min) + midroll_z_min
+    new_z = torch.where(is_mid, z_mid, z_stand)
+
+    env.sim.data.qpos[env_ids, 2] = new_z
+    env.sim.data.qpos[env_ids, 3:7] = quat
+    env.sim.data.qvel[env_ids, :6] = 0.0
+
+    servo_ids = _servo_joint_ids(env, asset)
+
+    # Mid-roll joints: lerp HOME → tuck on the overridden joints, noise on all
+    # servo joints (passive_* backlash hinges must stay at 0).
+    mid_env_ids = env_ids[is_mid]
+    if len(mid_env_ids) > 0 and tuck_overrides:
+        u = (
+            torch.rand(len(mid_env_ids), device=env.device)
+            * (tuck_factor_range[1] - tuck_factor_range[0])
+            + tuck_factor_range[0]
+        )
+        for jnt_idx, angle in tuck_overrides.items():
+            col = 7 + servo_ids[jnt_idx]
+            home = env.sim.data.qpos[mid_env_ids, col]
+            env.sim.data.qpos[mid_env_ids, col] = home + u * (angle - home)
+    if len(mid_env_ids) > 0 and joint_noise_std > 0.0:
+        cols = torch.tensor([7 + j for j in servo_ids], device=env.device, dtype=torch.long)
+        noise = torch.randn(len(mid_env_ids), len(cols), device=env.device) * joint_noise_std
+        env.sim.data.qpos[mid_env_ids.unsqueeze(1), cols.unsqueeze(0)] += noise
+
+    # Mid-roll backward angular momentum: rotation about body -y (a NEGATIVE
+    # qvel[4]). MuJoCo free joint qvel[3:6] is the angular velocity in the
+    # BODY frame, so [0, -ω, 0] is the backward-roll axis regardless of spawn
+    # yaw — mirroring the roulade's forward-roll convention.
+    if len(mid_env_ids) > 0 and midroll_omega_range[1] > 0.0:
+        omega = (
+            torch.rand(len(mid_env_ids), device=env.device)
+            * (midroll_omega_range[1] - midroll_omega_range[0])
+            + midroll_omega_range[0]
+        )
+        env.sim.data.qvel[mid_env_ids, 4] = _BACKFLIP_FWD_SIGN * omega
+
+    # Élan hook: backward base velocity for STANDING spawns, body -x mapped to
+    # world xy through the spawn yaw. (0, 0) = standstill start, disabled.
+    stand_env_ids = env_ids[~is_mid]
+    if len(stand_env_ids) > 0 and backward_vel_range[1] > 0.0:
+        vx = (
+            torch.rand(len(stand_env_ids), device=env.device)
+            * (backward_vel_range[1] - backward_vel_range[0])
+            + backward_vel_range[0]
+        )
+        yaw_s = yaw[~is_mid]
+        env.sim.data.qvel[stand_env_ids, 0] = -vx * torch.cos(yaw_s)
+        env.sim.data.qvel[stand_env_ids, 1] = -vx * torch.sin(yaw_s)
+
+    # Progress accounting: standing starts at 0, mid-roll at the spawn |pitch|.
+    spawn_angle = torch.where(is_mid, mid_pitch_mag, torch.zeros_like(mid_pitch_mag))
+    accum[env_ids] = spawn_angle
+    max_accum[env_ids] = spawn_angle
+    paid[env_ids] = spawn_angle
+    # Head latch: mid-roll spawns are considered already past the head phase
+    # (same rationale as the roulade). Standing spawns must earn it by
+    # actually rolling over the head.
+    env._backflip_head_latch[env_ids] = is_mid
+
+
+def backflip_progress(
+    env: ManagerBasedRlEnv,
+    target_angle: float = 2 * math.pi,
+    max_paid_rate: float = 5.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Pay increments of the back-flip progress frontier, up to one full roll.
+
+    Identical payout structure to roulade_progress, on the backward-rotation
+    frontier: potential-based, support-gated, flatness-gated, and paid-rate
+    capped (faster than the cap forfeits the excess).
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_backflip_accum(env, asset)
+    _, max_accum, paid = _backflip_state(env)
+    new_paid = torch.clamp(max_accum, max=target_angle)
+    delta = torch.clamp(new_paid - torch.clamp(paid, max=target_angle), min=0.0)
+    delta = torch.clamp(delta, max=max_paid_rate * env.step_dt)
+    env._backflip_paid = torch.maximum(paid, new_paid)
+    return delta / (env.step_dt * target_angle)
+
+
+def backflip_head_pivot(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "head_ground_contact",
+    angle_lo: float = math.radians(30.0),
+    angle_hi: float = math.radians(240.0),
+    rate_norm: float = 2.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward head-ground contact while rotating backward mid-roll.
+
+    Same shaping as roulade_head_pivot: contact × window × clamp(-ω_y/rate)
+    × (0.3 + 0.7·top_down). The rate factor is the anti-camping guard; the
+    top_down factor teaches the chin tuck (the flat head top must carry the
+    pivot, same as in the forward roll).
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_backflip_accum(env, asset)
+    accum, _, _ = _backflip_state(env)
+
+    if sensor_name not in env.scene.sensors:
+        return torch.zeros(env.num_envs, device=env.device)
+    found = env.scene.sensors[sensor_name].data.found
+    contact = (found.view(found.shape[0], -1) > 0).any(dim=-1).float()
+
+    in_window = ((accum > angle_lo) & (accum < angle_hi)).float()
+    omega_fwd = _BACKFLIP_FWD_SIGN * asset.data.root_link_ang_vel_b[:, 1]
+    rate = torch.clamp(torch.nan_to_num(omega_fwd, nan=0.0) / rate_norm, 0.0, 1.0)
+    top = 0.3 + 0.7 * _head_top_down(env, asset).float()
+    return contact * in_window * rate * top
+
+
+def backflip_landing_composite(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    height_std: float,
+    upright_std: float,
+    pose_std: float,
+    joint_indices: list,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    target_overrides: Optional[dict] = None,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """standing_composite_score × back-flip completion gate — the big annuity."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_backflip_accum(env, asset)
+    score = standing_composite_score(
+        env,
+        target_height=target_height,
+        height_std=height_std,
+        upright_std=upright_std,
+        pose_std=pose_std,
+        joint_indices=joint_indices,
+        target_overrides=target_overrides,
+        asset_cfg=asset_cfg,
+    )
+    return score * _backflip_completion_gate(env, gate_lo, gate_hi, require_head=True)
+
+
+def backflip_upright_after_roll(
+    env: ManagerBasedRlEnv,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Linear cos(tilt) × back-flip completion gate — bootstrap pull to vertical."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_backflip_accum(env, asset)
+    quat = asset.data.root_link_quat_w
+    upright = 1.0 - 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2))
+    return torch.clamp(upright, min=0.0) * _backflip_completion_gate(
+        env, gate_lo, gate_hi, require_head=True
+    )
+
+
+def backflip_height_after_roll(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    std: float = 0.04,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Broad height Gaussian × back-flip completion gate — pull up to standing."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_backflip_accum(env, asset)
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    g = torch.exp(-((z - target_height) / std) ** 2)
+    return g * _backflip_completion_gate(env, gate_lo, gate_hi, require_head=True)
+
+
+def backflip_landing_sharp(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    height_std: float = 0.015,
+    upright_std: float = 0.3,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Tight-std upright × height Gaussians × back-flip completion gate."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_backflip_accum(env, asset)
+    quat = asset.data.root_link_quat_w
+    tilt_sq = 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2))
+    upright_g = torch.exp(-tilt_sq / (upright_std * upright_std))
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    height_g = torch.exp(-((z - target_height) / height_std) ** 2)
+    gate = _backflip_completion_gate(env, gate_lo, gate_hi, require_head=True)
+    return upright_g * height_g * gate
+
+
+def backflip_stand_tax(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """SELF-NEGATING height L1 below target, active only after back-flip completion.
+
+    Returns −max(0, target − z) × completion_gate — use a POSITIVE weight
+    (penalty sign convention). Same anti-crumple-camping fix as
+    roulade_stand_tax: a post-roll heap must be net NEGATIVE, not merely
+    worse-than-standing.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_backflip_accum(env, asset)
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    shortfall = torch.clamp(target_height - z, min=0.0)
+    return -shortfall * _backflip_completion_gate(env, gate_lo, gate_hi, require_head=True)
+
+
+def backflip_rise_velocity(
+    env: ManagerBasedRlEnv,
+    max_height: float = 0.125,
+    gate_lo: float = math.radians(180.0),
+    gate_hi: float = math.radians(260.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """com_upward_velocity × late-back-flip gate — bootstrap the exit rise.
+
+    The second half of a back flip (on the back → sitting-up → standing) is
+    the same face-up recovery problem as the roulade's; pay for rising vz
+    directly, gated off above max_height so it can't be farmed by hopping.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_backflip_accum(env, asset)
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    vz = torch.nan_to_num(asset.data.root_link_lin_vel_w[:, 2], nan=0.0)
+    reward = torch.clamp(vz, min=0.0) * (z < max_height).float()
+    return reward * _backflip_completion_gate(env, gate_lo, gate_hi, require_head=True)
+
+
+def backflip_overspeed_penalty(
+    env: ManagerBasedRlEnv,
+    omega_max: float = 7.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """max(0, |ω_y| − omega_max)² — quadratic tax on whip-speed rotation.
+
+    Direction-agnostic (|ω_y|): complements the paid-rate cap in
+    backflip_progress the same way roulade_overspeed_penalty complements
+    roulade_progress.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    omega_y = torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 1], nan=0.0)
+    excess = torch.clamp(omega_y.abs() - omega_max, min=0.0)
+    return excess.pow(2)
+
+
+def backflip_sagittal_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Rotation out of the sagittal plane: body-frame ω_x² + ω_z² (positive;
+    use a negative weight). Same straightness pressure as the roulade."""
+    asset: Entity = env.scene[asset_cfg.name]
+    omega_b = asset.data.root_link_ang_vel_b
+    return torch.nan_to_num(omega_b[:, 0].pow(2) + omega_b[:, 2].pow(2), nan=0.0)
+
+
+def backflip_lateral_velocity_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+def backflip_flatness_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """(lateral-axis world-z)² — dense gradient toward a sagittal back roll.
+
+    Same geometric quantity as roulade_flatness_penalty: pure backward pitch
+    keeps the lateral axis horizontal, so a clean back flip pays ~0 here.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.nan_to_num(_lateral_axis_z(asset.data.root_link_quat_w), nan=0.0).pow(2)
