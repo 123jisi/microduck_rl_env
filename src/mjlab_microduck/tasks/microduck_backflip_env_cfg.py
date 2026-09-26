@@ -32,8 +32,10 @@ BACK-FLIP SPECIFIC NOTES:
     landing stack (composite / upright / height / sharp / stand tax /
     rise velocity) only reads the rotation frontier, so it needs no sign
     change — it fires on the same 260°–330° window.
-  • The head plants the same way (jaw_soft's flat top): the head-pivot
-    shaping and the top-down latch are reused as-is.
+  • A grounded back roll must make head contact while moving backward in the
+    sagittal plane.  Flat-head-top orientation is rewarded as style shaping,
+    but is not a hard completion veto (that forward-roll calibration rejected
+    valid backward rolls and left the whole landing stack at zero).
   • Mirror loss: the back flip is sagittal / left-right symmetric exactly
     like the roulade, so the same 61-dim mirror table applies.
 
@@ -95,8 +97,9 @@ MIDROLL_PITCH_MIN   = math.radians(50.0)
 MIDROLL_PITCH_MAX   = math.radians(340.0)
 MIDROLL_OMEGA_RANGE = (0.0, 3.0)   # rad/s backward momentum at spawn
 # Tuck anchor: legs folded (crouch-anchor values from the velstand crouch
-# reset) + CHIN TUCK (the head-top latch requires it: neck_pitch −1 /
-# head_pitch +1 puts the flat head top squarely on the floor). Identical to
+# reset) + CHIN TUCK (it makes the head transit safer and earns the head-pivot
+# style reward: neck_pitch −1 / head_pitch +1 puts the flat head top squarely
+# on the floor). Identical to
 # the roulade's TUCK_OVERRIDES — the tucked configuration is direction-
 # agnostic; only the pitch SIGN differs, and that lives in mdp.py's reset.
 TUCK_OVERRIDES = {

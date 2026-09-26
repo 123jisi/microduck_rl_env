@@ -1,5 +1,7 @@
 import math
 
+import torch
+
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_backflip_env_cfg import (
     make_microduck_backflip_env_cfg,
@@ -101,3 +103,21 @@ def test_required_sensors_registered():
     # accumulator support gate + head latch read these by name (load-bearing)
     assert "robot_ground_contact" in names
     assert "head_ground_contact" in names
+
+
+def test_backflip_head_latch_accepts_only_a_grounded_backward_sagittal_transit():
+    candidate = microduck_mdp._backflip_head_latch_candidate(
+        # Valid, no contact, wrong direction, too early, too late, side roll.
+        head_contact=torch.tensor([True, False, True, True, True, True]),
+        accum=torch.tensor([
+            math.radians(120.0),
+            math.radians(120.0),
+            math.radians(120.0),
+            math.radians(10.0),
+            math.radians(270.0),
+            math.radians(120.0),
+        ]),
+        omega_fwd=torch.tensor([2.0, 2.0, -2.0, 2.0, 2.0, 2.0]),
+        lateral_axis_z_abs=torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.9]),
+    )
+    assert candidate.tolist() == [True, False, False, False, False, False]

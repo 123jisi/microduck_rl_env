@@ -7208,10 +7208,14 @@ def roulade_lateral_velocity_penalty(
 # even coexist in one process.
 #
 # Back-flip specific notes:
-#   • The head pivot is the SAME body contact (jaw_soft carries the flat head
-#     top in robot_allcollisions.xml); in a back flip the head plants just as
-#     in a roulade. The _head_top_down check is direction-agnostic (it tests
-#     geometry, not motion), so it is reused as-is.
+#   • The head pivot is the SAME body contact (jaw_soft carries the head
+#     collision geoms), but the completion latch is deliberately less specific
+#     than the forward-roll latch.  A backward roll reaches the floor through
+#     the back/head transition, so requiring the empirically calibrated
+#     forward-roll ``_head_top_down`` pose can reject a visually valid grounded
+#     backward roll.  The latch instead requires head contact while rotating
+#     backward in the sagittal plane.  ``backflip_head_pivot`` still gives
+#     extra shaping credit for putting the flat head top down cleanly.
 #   • Landing after a backward roll is over the BACK: the completion-gated
 #     landing stack (composite / upright / height / sharp / stand tax / rise
 #     velocity) is unchanged — it only reads the frontier, not the path.
@@ -7223,6 +7227,16 @@ _BACKFLIP_FWD_SIGN = -1.0  # backward roll = NEGATIVE body-frame ω_y
 # Sensor names read by the accumulator update (must match the env cfg).
 _BACKFLIP_SUPPORT_SENSOR = "robot_ground_contact"
 _BACKFLIP_HEAD_SENSOR = "head_ground_contact"
+
+# A grounded backward roll must touch the head while moving backward through
+# the middle of the manoeuvre.  These are intentionally backflip-specific:
+# the old implementation reused the forward-roll top-down latch verbatim and
+# kept every completion/landing reward at exactly zero even for a successful
+# backward roll.  The upper bound stays below the landing window so the
+# authenticity latch must be earned before the standing annuity can open.
+_BACKFLIP_HEAD_LATCH_LO = math.radians(20.0)
+_BACKFLIP_HEAD_LATCH_HI = math.radians(260.0)
+_BACKFLIP_HEAD_LATCH_MIN_RATE = 0.25
 
 
 def _backflip_state(env: ManagerBasedRlEnv) -> tuple:
@@ -7237,13 +7251,33 @@ def _backflip_state(env: ManagerBasedRlEnv) -> tuple:
     return env._backflip_accum, env._backflip_max, env._backflip_paid
 
 
+def _backflip_head_latch_candidate(
+    head_contact: torch.Tensor,
+    accum: torch.Tensor,
+    omega_fwd: torch.Tensor,
+    lateral_axis_z_abs: torch.Tensor,
+) -> torch.Tensor:
+    """Return the grounded-backward-roll authenticity latch condition.
+
+    Head contact separates a ground roll from an aerial backflip; positive
+    ``omega_fwd`` separates the intended backward transit from a static
+    head-rest or a forward recovery; and the lateral-axis check rejects a
+    shoulder/side roll.  Head-top orientation is intentionally *not* a hard
+    condition here: it remains soft style shaping in ``backflip_head_pivot``.
+    """
+    in_window = (accum > _BACKFLIP_HEAD_LATCH_LO) & (accum < _BACKFLIP_HEAD_LATCH_HI)
+    moving_backward = omega_fwd > _BACKFLIP_HEAD_LATCH_MIN_RATE
+    sagittal = lateral_axis_z_abs < _FLAT_ZERO
+    return head_contact & in_window & moving_backward & sagittal
+
+
 def _update_backflip_accum(env: ManagerBasedRlEnv, asset: Entity) -> None:
     """Integrate BACKWARD pitch rate into the per-env rotation accumulator.
 
     Identical structure to _update_roulade_accum, with the sign flipped
     (_BACKFLIP_FWD_SIGN = -1.0) so backward rotation grows the frontier.
-    Step-guarded, support-gated, flatness-gated, and latches the head-top
-    contact exactly like the forward roll.
+    Step-guarded, support-gated, flatness-gated, and latches a genuine
+    grounded backward head transit before completion rewards can open.
     """
     _backflip_state(env)
     step = int(env.common_step_counter)
@@ -7254,20 +7288,23 @@ def _update_backflip_accum(env: ManagerBasedRlEnv, asset: Entity) -> None:
         if supported is not None:
             delta = delta * supported.float()
         # Sagittal flatness gate (same as roulade): side/shoulder rolls don't count.
-        y_z = torch.nan_to_num(_lateral_axis_z(asset.data.root_link_quat_w), nan=1.0).abs()
-        t = torch.clamp((_FLAT_ZERO - y_z) / (_FLAT_ZERO - _FLAT_FULL), 0.0, 1.0)
+        y_z_abs = torch.nan_to_num(
+            _lateral_axis_z(asset.data.root_link_quat_w), nan=1.0
+        ).abs()
+        t = torch.clamp((_FLAT_ZERO - y_z_abs) / (_FLAT_ZERO - _FLAT_FULL), 0.0, 1.0)
         delta = delta * (t * t * (3.0 - 2.0 * t))
         env._backflip_accum = env._backflip_accum + delta
         env._backflip_max = torch.maximum(env._backflip_max, env._backflip_accum)
 
         head_contact = _sensor_any_contact(env, _BACKFLIP_HEAD_SENSOR)
         if head_contact is not None:
-            in_window = (env._backflip_accum > _HEAD_LATCH_LO) & (
-                env._backflip_accum < _HEAD_LATCH_HI
-            )
-            # Same direction-agnostic top-down latch as the roulade.
             env._backflip_head_latch = env._backflip_head_latch | (
-                head_contact & in_window & _head_top_down(env, asset)
+                _backflip_head_latch_candidate(
+                    head_contact,
+                    env._backflip_accum,
+                    omega_fwd,
+                    y_z_abs,
+                )
             )
         env._backflip_last_update_step = step
 
