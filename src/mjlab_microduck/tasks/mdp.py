@@ -7324,6 +7324,48 @@ def _backflip_completion_gate(
     return gate
 
 
+def _backflip_clean_stand_gate_from_contacts(
+    completion_gate: torch.Tensor,
+    feet_contact: torch.Tensor,
+    head_contact: torch.Tensor,
+) -> torch.Tensor:
+    """Require completed roll, both feet down, and the head off the ground."""
+    both_feet = (feet_contact.view(feet_contact.shape[0], -1) > 0).all(dim=-1)
+    head_clear = ~(head_contact.view(head_contact.shape[0], -1) > 0).any(dim=-1)
+    return completion_gate * both_feet.float() * head_clear.float()
+
+
+def _backflip_clean_stand_gate(
+    env: ManagerBasedRlEnv,
+    gate_lo: float,
+    gate_hi: float,
+    feet_sensor_name: str = "feet_ground_contact",
+    head_sensor_name: str = "head_ground_contact",
+) -> torch.Tensor:
+    """Completion gate restricted to a current, clean two-foot support state.
+
+    The head latch proves that the head touched during the roll.  It is
+    intentionally historical, so current contacts must be checked separately
+    here to prevent the policy from farming the landing annuity as a head-foot
+    tripod.
+    """
+    completion = _backflip_completion_gate(env, gate_lo, gate_hi, require_head=True)
+    if feet_sensor_name not in env.scene.sensors or head_sensor_name not in env.scene.sensors:
+        return torch.zeros_like(completion)
+    feet_found = env.scene.sensors[feet_sensor_name].data.found
+    head_found = env.scene.sensors[head_sensor_name].data.found
+    return _backflip_clean_stand_gate_from_contacts(completion, feet_found, head_found)
+
+
+def _normalized_height_shortfall(
+    z: torch.Tensor,
+    target_height: float,
+    shortfall_scale: float,
+) -> torch.Tensor:
+    """Height deficit in target-height units, clipped to one."""
+    return torch.clamp((target_height - z) / max(shortfall_scale, 1e-6), 0.0, 1.0)
+
+
 def reset_backflip_state(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,
@@ -7515,7 +7557,7 @@ def backflip_landing_composite(
     target_overrides: Optional[dict] = None,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """standing_composite_score × back-flip completion gate — the big annuity."""
+    """Standing score paid only on clean two-foot, head-clear support."""
     asset: Entity = env.scene[asset_cfg.name]
     _update_backflip_accum(env, asset)
     score = standing_composite_score(
@@ -7528,7 +7570,7 @@ def backflip_landing_composite(
         target_overrides=target_overrides,
         asset_cfg=asset_cfg,
     )
-    return score * _backflip_completion_gate(env, gate_lo, gate_hi, require_head=True)
+    return score * _backflip_clean_stand_gate(env, gate_lo, gate_hi)
 
 
 def backflip_upright_after_roll(
@@ -7574,7 +7616,7 @@ def backflip_landing_sharp(
     gate_hi: float = math.radians(330.0),
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Tight-std upright × height Gaussians × back-flip completion gate."""
+    """Tight upright × height score on clean two-foot, head-clear support."""
     asset: Entity = env.scene[asset_cfg.name]
     _update_backflip_accum(env, asset)
     quat = asset.data.root_link_quat_w
@@ -7584,31 +7626,76 @@ def backflip_landing_sharp(
         asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
     )
     height_g = torch.exp(-((z - target_height) / height_std) ** 2)
-    gate = _backflip_completion_gate(env, gate_lo, gate_hi, require_head=True)
+    gate = _backflip_clean_stand_gate(env, gate_lo, gate_hi)
     return upright_g * height_g * gate
 
 
 def backflip_stand_tax(
     env: ManagerBasedRlEnv,
     target_height: float,
+    shortfall_scale: float = 0.02,
     gate_lo: float = math.radians(260.0),
     gate_hi: float = math.radians(330.0),
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """SELF-NEGATING height L1 below target, active only after back-flip completion.
+    """SELF-NEGATING normalized height deficit after back-flip completion.
 
-    Returns −max(0, target − z) × completion_gate — use a POSITIVE weight
-    (penalty sign convention). Same anti-crumple-camping fix as
-    roulade_stand_tax: a post-roll heap must be net NEGATIVE, not merely
-    worse-than-standing.
+    A deficit of ``shortfall_scale`` or more returns -1 before gating, making
+    the cost dimensionless and strong enough to dislodge a stable crouch.
+    Use a POSITIVE weight (penalty sign convention).
     """
     asset: Entity = env.scene[asset_cfg.name]
     _update_backflip_accum(env, asset)
     z = torch.nan_to_num(
         asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
     )
-    shortfall = torch.clamp(target_height - z, min=0.0)
+    shortfall = _normalized_height_shortfall(z, target_height, shortfall_scale)
     return -shortfall * _backflip_completion_gate(env, gate_lo, gate_hi, require_head=True)
+
+
+def backflip_head_contact_after_roll_penalty(
+    env: ManagerBasedRlEnv,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    sensor_name: str = "head_ground_contact",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Current head contact after completion (non-negative; use negative weight)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_backflip_accum(env, asset)
+    head_contact = _sensor_any_contact(env, sensor_name)
+    if head_contact is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    gate = _backflip_completion_gate(env, gate_lo, gate_hi, require_head=True)
+    return head_contact.float() * gate
+
+
+def backflip_standing_success_bonus(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    height_tol: float,
+    upright_threshold: float,
+    pose_tol: float,
+    joint_indices: list,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    target_overrides: Optional[dict] = None,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Strict final-pose bonus on clean support after a genuine roll."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_backflip_accum(env, asset)
+    success = standing_success_bonus(
+        env,
+        target_height=target_height,
+        height_tol=height_tol,
+        upright_threshold=upright_threshold,
+        pose_tol=pose_tol,
+        joint_indices=joint_indices,
+        target_overrides=target_overrides,
+        asset_cfg=asset_cfg,
+    )
+    return success * _backflip_clean_stand_gate(env, gate_lo, gate_hi)
 
 
 def backflip_rise_velocity(

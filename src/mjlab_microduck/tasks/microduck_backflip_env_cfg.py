@@ -264,8 +264,9 @@ def make_microduck_backflip_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         },
     )
 
-    # Completion-gated standing annuity — the dominant attractor. Broad stds
-    # (standup composite lesson: partial landing must score visibly, ~0.2+).
+    # Clean-support standing annuity — paid only with both feet down and the
+    # head currently clear. Include the neck so it cannot remain folded as a
+    # third support after the roll.
     cfg.rewards["backflip_landing_composite"] = RewardTermCfg(
         func=microduck_mdp.backflip_landing_composite,
         weight=4.0,
@@ -274,7 +275,7 @@ def make_microduck_backflip_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "height_std":       0.04,
             "upright_std":      0.40,
             "pose_std":         0.40,
-            "joint_indices":    _LEG_JOINTS,
+            "joint_indices":    _LEG_JOINTS + _NECK_JOINTS,
             "gate_lo":          LANDING_GATE_LO,
             "gate_hi":          LANDING_GATE_HI,
             "target_overrides": None,
@@ -285,12 +286,12 @@ def make_microduck_backflip_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # composite product is ≈0): linear upright + broad height Gaussian.
     cfg.rewards["backflip_upright_after_roll"] = RewardTermCfg(
         func=microduck_mdp.backflip_upright_after_roll,
-        weight=1.5,
+        weight=0.75,
         params={"gate_lo": LANDING_GATE_LO, "gate_hi": LANDING_GATE_HI},
     )
     cfg.rewards["backflip_height_after_roll"] = RewardTermCfg(
         func=microduck_mdp.backflip_height_after_roll,
-        weight=1.0,
+        weight=0.5,
         params={
             "target_height": STAND_Z,
             "std":           0.04,
@@ -307,8 +308,8 @@ def make_microduck_backflip_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         weight=2.0,
         params={
             "target_height": STAND_Z,
-            "height_std":    0.015,
-            "upright_std":   0.3,
+            "height_std":    0.010,
+            "upright_std":   0.20,
             "gate_lo":       LANDING_GATE_LO,
             "gate_hi":       LANDING_GATE_HI,
         },
@@ -320,11 +321,43 @@ def make_microduck_backflip_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # SELF-NEGATING func → POSITIVE weight (penalty sign convention).
     cfg.rewards["backflip_stand_tax"] = RewardTermCfg(
         func=microduck_mdp.backflip_stand_tax,
-        weight=5.0,
+        weight=2.0,
         params={
             "target_height": STAND_Z,
+            "shortfall_scale": 0.02,
             "gate_lo":       LANDING_GATE_LO,
             "gate_hi":       LANDING_GATE_HI,
+        },
+    )
+
+    # The historical head latch proves a real grounded roll occurred; this
+    # current-contact cost makes keeping the head planted after completion
+    # strictly unattractive. The function is a non-negative cost.
+    cfg.rewards["backflip_head_contact_after_roll"] = RewardTermCfg(
+        func=microduck_mdp.backflip_head_contact_after_roll_penalty,
+        weight=-2.0,
+        params={
+            "sensor_name": head_ground_cfg.name,
+            "gate_lo": LANDING_GATE_LO,
+            "gate_hi": LANDING_GATE_HI,
+        },
+    )
+
+    # Hard final-state attractor. Bootstrap terms above still provide gradient
+    # while recovering; this bonus distinguishes truly standing from a lean or
+    # deep crouch, and uses the same clean-support gate as the landing annuity.
+    cfg.rewards["backflip_standing_success"] = RewardTermCfg(
+        func=microduck_mdp.backflip_standing_success_bonus,
+        weight=4.0,
+        params={
+            "target_height": STAND_Z,
+            "height_tol": 0.0075,
+            "upright_threshold": math.cos(math.radians(15.0)),
+            "pose_tol": 0.25,
+            "joint_indices": _LEG_JOINTS + _NECK_JOINTS,
+            "gate_lo": LANDING_GATE_LO,
+            "gate_hi": LANDING_GATE_HI,
+            "target_overrides": None,
         },
     )
 
@@ -347,7 +380,7 @@ def make_microduck_backflip_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # penalties provide the dense per-step gradient back toward the plane.
     cfg.rewards["backflip_sagittal"] = RewardTermCfg(
         func=microduck_mdp.backflip_sagittal_penalty,
-        weight=-0.1,
+        weight=-0.25,
     )
     cfg.rewards["backflip_lateral_vel"] = RewardTermCfg(
         func=microduck_mdp.backflip_lateral_velocity_penalty,
@@ -356,6 +389,35 @@ def make_microduck_backflip_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.rewards["backflip_flatness"] = RewardTermCfg(
         func=microduck_mdp.backflip_flatness_penalty,
         weight=-0.5,
+    )
+
+    # The trunk-only plane checks above cannot see an articulated cheat where
+    # the head yaws/rolls and the legs sweep around the side. Keep only the
+    # lateral DOFs near HOME; pitch joints remain free for the required tuck.
+    cfg.rewards["backflip_lateral_joint_deviation"] = RewardTermCfg(
+        func=microduck_mdp.joint_deviation_l1,
+        weight=-0.5,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=(
+                    "left_hip_yaw",
+                    "left_hip_roll",
+                    "head_yaw",
+                    "head_roll",
+                    "right_hip_yaw",
+                    "right_hip_roll",
+                ),
+            )
+        },
+    )
+
+    # A clean sagittal roll carries both feet over the head together. Mirror
+    # consistency prevents one leg from becoming a side-sweeping pivot while
+    # leaving the symmetric pitch/knee/ankle tuck available.
+    cfg.rewards["backflip_leg_symmetry"] = RewardTermCfg(
+        func=microduck_mdp.leg_symmetry_reward,
+        weight=0.5,
     )
 
     # ── Sim2real regularisers ─────────────────────────────────────────────────
