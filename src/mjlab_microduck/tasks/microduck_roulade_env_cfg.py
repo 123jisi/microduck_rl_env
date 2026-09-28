@@ -262,8 +262,9 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         },
     )
 
-    # Completion-gated standing annuity — the dominant attractor. Broad stds
-    # (standup composite lesson: partial landing must score visibly, ~0.2+).
+    # Clean-support standing annuity — the dominant attractor. It includes the
+    # neck/head joints and pays only with both feet down and the head clear.
+    # One or two recovery steps remain possible, but shuffling cannot farm it.
     cfg.rewards["roulade_landing_composite"] = RewardTermCfg(
         func=microduck_mdp.roulade_landing_composite,
         weight=4.0,
@@ -272,7 +273,7 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "height_std":       0.04,
             "upright_std":      0.40,
             "pose_std":         0.40,
-            "joint_indices":    _LEG_JOINTS,
+            "joint_indices":    _LEG_JOINTS + _NECK_JOINTS,
             "gate_lo":          LANDING_GATE_LO,
             "gate_hi":          LANDING_GATE_HI,
             "target_overrides": None,
@@ -283,12 +284,12 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # composite product is ≈0): linear upright + broad height Gaussian.
     cfg.rewards["roulade_upright_after_roll"] = RewardTermCfg(
         func=microduck_mdp.roulade_upright_after_roll,
-        weight=1.5,
+        weight=0.75,
         params={"gate_lo": LANDING_GATE_LO, "gate_hi": LANDING_GATE_HI},
     )
     cfg.rewards["roulade_height_after_roll"] = RewardTermCfg(
         func=microduck_mdp.roulade_height_after_roll,
-        weight=1.0,
+        weight=0.5,
         params={
             "target_height": STAND_Z,
             "std":           0.04,
@@ -307,8 +308,8 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         weight=2.0,
         params={
             "target_height": STAND_Z,
-            "height_std":    0.015,
-            "upright_std":   0.3,
+            "height_std":    0.010,
+            "upright_std":   0.20,
             "gate_lo":       LANDING_GATE_LO,
             "gate_hi":       LANDING_GATE_HI,
         },
@@ -322,11 +323,70 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # mid/late-roll spawns are born with it active, which is the point.
     cfg.rewards["roulade_stand_tax"] = RewardTermCfg(
         func=microduck_mdp.roulade_stand_tax,
-        weight=5.0,
+        weight=2.0,
         params={
             "target_height": STAND_Z,
+            "shortfall_scale": 0.02,
             "gate_lo":       LANDING_GATE_LO,
             "gate_hi":       LANDING_GATE_HI,
+        },
+    )
+
+    # The historical head latch proves that the head was used during the roll;
+    # this current-contact cost prevents keeping it planted afterwards.
+    cfg.rewards["roulade_head_contact_after_roll"] = RewardTermCfg(
+        func=microduck_mdp.roulade_head_contact_after_roll_penalty,
+        weight=-2.0,
+        params={
+            "sensor_name": head_ground_cfg.name,
+            "gate_lo": LANDING_GATE_LO,
+            "gate_hi": LANDING_GATE_HI,
+        },
+    )
+
+    # Smooth bridge from the current wobbling solution to a settled stand.
+    # Widths are based on the model_6000 probe (vxy≈0.26 m/s, trunk ω≈0.85,
+    # neck qdot≈3.1 rad/s), so the old policy scores visibly rather than seeing
+    # an all-zero objective. Clean support makes this an opportunity reward:
+    # balancing steps are allowed, but settling sooner earns more total annuity.
+    cfg.rewards["roulade_settled_standing"] = RewardTermCfg(
+        func=microduck_mdp.roulade_settled_standing_score,
+        weight=2.0,
+        params={
+            "target_height": STAND_Z,
+            "height_std": 0.02,
+            "upright_std": 0.25,
+            "pose_std": 0.30,
+            "joint_indices": _LEG_JOINTS + _NECK_JOINTS,
+            "neck_joint_indices": _NECK_JOINTS,
+            "planar_speed_std": 0.30,
+            "trunk_ang_vel_std": 1.0,
+            "neck_speed_std": 3.0,
+            "gate_lo": LANDING_GATE_LO,
+            "gate_hi": LANDING_GATE_HI,
+            "target_overrides": None,
+        },
+    )
+
+    # Hard final-state attractor: correct all-joint HOME pose, clean two-foot
+    # support, and low residual body/head speed. A momentary two-foot touch
+    # while the head swings through the target does not count as success.
+    cfg.rewards["roulade_standing_success"] = RewardTermCfg(
+        func=microduck_mdp.roulade_standing_success_bonus,
+        weight=4.0,
+        params={
+            "target_height": STAND_Z,
+            "height_tol": 0.0075,
+            "upright_threshold": math.cos(math.radians(15.0)),
+            "pose_tol": 0.25,
+            "joint_indices": _LEG_JOINTS + _NECK_JOINTS,
+            "neck_joint_indices": _NECK_JOINTS,
+            "max_planar_speed": 0.08,
+            "max_trunk_ang_vel": 0.35,
+            "max_neck_speed": 0.75,
+            "gate_lo": LANDING_GATE_LO,
+            "gate_hi": LANDING_GATE_HI,
+            "target_overrides": None,
         },
     )
 

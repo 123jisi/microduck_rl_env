@@ -6782,6 +6782,38 @@ def _roulade_completion_gate(
     return gate
 
 
+def _roulade_clean_stand_gate_from_contacts(
+    completion_gate: torch.Tensor,
+    feet_contact: torch.Tensor,
+    head_contact: torch.Tensor,
+) -> torch.Tensor:
+    """Require a completed roll, both feet down, and the head off the ground."""
+    both_feet = (feet_contact.view(feet_contact.shape[0], -1) > 0).all(dim=-1)
+    head_clear = ~(head_contact.view(head_contact.shape[0], -1) > 0).any(dim=-1)
+    return completion_gate * both_feet.float() * head_clear.float()
+
+
+def _roulade_clean_stand_gate(
+    env: ManagerBasedRlEnv,
+    gate_lo: float,
+    gate_hi: float,
+    feet_sensor_name: str = "feet_ground_contact",
+    head_sensor_name: str = "head_ground_contact",
+) -> torch.Tensor:
+    """Completion gate restricted to current clean two-foot support.
+
+    The historical head latch proves that a real roll happened. It says
+    nothing about the current support state, so the landing annuity needs a
+    separate check for two feet down and the head currently clear.
+    """
+    completion = _roulade_completion_gate(env, gate_lo, gate_hi, require_head=True)
+    if feet_sensor_name not in env.scene.sensors or head_sensor_name not in env.scene.sensors:
+        return torch.zeros_like(completion)
+    feet_found = env.scene.sensors[feet_sensor_name].data.found
+    head_found = env.scene.sensors[head_sensor_name].data.found
+    return _roulade_clean_stand_gate_from_contacts(completion, feet_found, head_found)
+
+
 def reset_roulade_state(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,
@@ -6990,12 +7022,13 @@ def roulade_landing_composite(
     target_overrides: Optional[dict] = None,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """standing_composite_score × completion gate.
+    """Standing composite paid only on clean two-foot, head-clear support.
 
     The big annuity: once the roll is (nearly) complete, every step spent
     standing at HOME pose pays — finishing on the feet and staying there
     dominates every partial outcome. Zero before gate_lo of rotation, so the
-    standing spawn cannot farm it by doing nothing.
+    standing spawn cannot farm it by doing nothing. Requiring current clean
+    support makes repeated one-foot shuffling strictly worse than settling.
     """
     asset: Entity = env.scene[asset_cfg.name]
     _update_roulade_accum(env, asset)
@@ -7009,7 +7042,7 @@ def roulade_landing_composite(
         target_overrides=target_overrides,
         asset_cfg=asset_cfg,
     )
-    return score * _roulade_completion_gate(env, gate_lo, gate_hi, require_head=True)
+    return score * _roulade_clean_stand_gate(env, gate_lo, gate_hi)
 
 
 def roulade_upright_after_roll(
@@ -7060,7 +7093,7 @@ def roulade_landing_sharp(
     gate_hi: float = math.radians(330.0),
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Tight-std upright × height Gaussians × completion gate — the last mile.
+    """Tight upright × height score on clean two-foot, head-clear support.
 
     Run-4 fix for the 27°-lean / 1-cm-crouch end basin: the broad landing
     composite (upright_std 0.40) scores ~0.5 at that pose, so the policy
@@ -7077,21 +7110,22 @@ def roulade_landing_sharp(
         asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
     )
     height_g = torch.exp(-((z - target_height) / height_std) ** 2)
-    gate = _roulade_completion_gate(env, gate_lo, gate_hi, require_head=True)
+    gate = _roulade_clean_stand_gate(env, gate_lo, gate_hi)
     return upright_g * height_g * gate
 
 
 def roulade_stand_tax(
     env: ManagerBasedRlEnv,
     target_height: float,
+    shortfall_scale: float = 0.02,
     gate_lo: float = math.radians(260.0),
     gate_hi: float = math.radians(330.0),
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """SELF-NEGATING height L1 below target, active only after roll completion.
+    """SELF-NEGATING normalized height deficit after roll completion.
 
-    Returns −max(0, target − z) × completion_gate — use a POSITIVE weight
-    (penalty sign convention). The run-3 fix for post-roll crumple-camping:
+    A deficit of ``shortfall_scale`` or more returns -1 before gating. Use a
+    POSITIVE weight (penalty sign convention). The run-3 fix for post-roll crumple-camping:
     the gated landing rewards made standing better than lying in a heap, but
     the heap itself was FREE — with only positive gated terms, "stay crumpled"
     collects ≈0/step, a comfortable basin (the standup static-sit lesson:
@@ -7104,8 +7138,126 @@ def roulade_stand_tax(
     z = torch.nan_to_num(
         asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
     )
-    shortfall = torch.clamp(target_height - z, min=0.0)
+    shortfall = _normalized_height_shortfall(z, target_height, shortfall_scale)
     return -shortfall * _roulade_completion_gate(env, gate_lo, gate_hi, require_head=True)
+
+
+def roulade_head_contact_after_roll_penalty(
+    env: ManagerBasedRlEnv,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    sensor_name: str = "head_ground_contact",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Current head contact after completion (non-negative; use negative weight)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_roulade_accum(env, asset)
+    head_contact = _sensor_any_contact(env, sensor_name)
+    if head_contact is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    gate = _roulade_completion_gate(env, gate_lo, gate_hi, require_head=True)
+    return head_contact.float() * gate
+
+
+def roulade_settled_standing_score(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    height_std: float,
+    upright_std: float,
+    pose_std: float,
+    joint_indices: list,
+    neck_joint_indices: list,
+    planar_speed_std: float,
+    trunk_ang_vel_std: float,
+    neck_speed_std: float,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    target_overrides: Optional[dict] = None,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Smooth final-pose × stillness score on clean support.
+
+    This is an opportunity reward rather than an immediate step penalty:
+    taking one or two recovery steps is allowed, but a moving one-foot state
+    earns none of this annuity. Once both feet are down, reducing horizontal
+    drift, trunk wobble, and neck speed smoothly raises the reward toward one.
+    The velocity widths are deliberately broad enough for the current policy
+    to see gradient instead of an all-zero target.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_roulade_accum(env, asset)
+    pose_score = standing_composite_score(
+        env,
+        target_height=target_height,
+        height_std=height_std,
+        upright_std=upright_std,
+        pose_std=pose_std,
+        joint_indices=joint_indices,
+        target_overrides=target_overrides,
+        asset_cfg=asset_cfg,
+    )
+    planar_speed_sq = torch.nan_to_num(
+        asset.data.root_link_lin_vel_w[:, :2].square().sum(dim=-1), nan=0.0
+    )
+    trunk_ang_vel_sq = torch.nan_to_num(
+        asset.data.root_link_ang_vel_w[:, :2].square().sum(dim=-1), nan=0.0
+    )
+    neck_vel_sq = torch.nan_to_num(
+        _servo_joint_vel(env, asset)[:, neck_joint_indices].square().mean(dim=-1), nan=0.0
+    )
+    motion_score = (
+        torch.exp(-planar_speed_sq / (planar_speed_std * planar_speed_std))
+        * torch.exp(-trunk_ang_vel_sq / (trunk_ang_vel_std * trunk_ang_vel_std))
+        * torch.exp(-neck_vel_sq / (neck_speed_std * neck_speed_std))
+    )
+    return pose_score * motion_score * _roulade_clean_stand_gate(env, gate_lo, gate_hi)
+
+
+def roulade_standing_success_bonus(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    height_tol: float,
+    upright_threshold: float,
+    pose_tol: float,
+    joint_indices: list,
+    neck_joint_indices: list,
+    max_planar_speed: float,
+    max_trunk_ang_vel: float,
+    max_neck_speed: float,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    target_overrides: Optional[dict] = None,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Binary bonus for a genuinely settled final standing state.
+
+    Pose and clean support alone still admit a momentary two-foot touch while
+    the head and trunk are swinging through it. The velocity limits make the
+    large terminal annuity available only after the robot has actually stopped.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_roulade_accum(env, asset)
+    pose_success = standing_success_bonus(
+        env,
+        target_height=target_height,
+        height_tol=height_tol,
+        upright_threshold=upright_threshold,
+        pose_tol=pose_tol,
+        joint_indices=joint_indices,
+        target_overrides=target_overrides,
+        asset_cfg=asset_cfg,
+    )
+    planar_speed = torch.linalg.vector_norm(asset.data.root_link_lin_vel_w[:, :2], dim=-1)
+    trunk_ang_vel = torch.linalg.vector_norm(asset.data.root_link_ang_vel_w[:, :2], dim=-1)
+    neck_speed = torch.sqrt(
+        _servo_joint_vel(env, asset)[:, neck_joint_indices].square().mean(dim=-1)
+    )
+    stable = (
+        (torch.nan_to_num(planar_speed, nan=float("inf")) <= max_planar_speed)
+        & (torch.nan_to_num(trunk_ang_vel, nan=float("inf")) <= max_trunk_ang_vel)
+        & (torch.nan_to_num(neck_speed, nan=float("inf")) <= max_neck_speed)
+    )
+    return pose_success * stable.float() * _roulade_clean_stand_gate(env, gate_lo, gate_hi)
 
 
 def roulade_rise_velocity(
