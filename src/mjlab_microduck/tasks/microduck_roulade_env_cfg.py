@@ -262,9 +262,29 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         },
     )
 
-    # Clean-support standing annuity — the dominant attractor. It includes the
-    # neck/head joints and pays only with both feet down and the head clear.
-    # One or two recovery steps remain possible, but shuffling cannot farm it.
+    # Recovery bridge: completion-gated but deliberately NOT clean-gated.  A
+    # low/head-supported state must see a continuous direction toward standing;
+    # otherwise the post-roll taxes below make stopping before completion the
+    # safest local optimum.  The clean-support annuity remains larger.
+    cfg.rewards["roulade_recovery_composite"] = RewardTermCfg(
+        func=microduck_mdp.roulade_recovery_composite,
+        weight=2.0,
+        params={
+            "target_height":    STAND_Z,
+            "height_std":       0.04,
+            "upright_std":      0.40,
+            "pose_std":         0.40,
+            "joint_indices":    _LEG_JOINTS + _NECK_JOINTS,
+            "gate_lo":          LANDING_GATE_LO,
+            "gate_hi":          LANDING_GATE_HI,
+            "target_overrides": None,
+        },
+    )
+
+    # Clean-support standing annuity — the dominant final-state attractor. It
+    # includes the neck/head joints and pays only with both feet down and the
+    # head clear. One or two recovery steps remain possible, but shuffling
+    # cannot farm the highest-value layer.
     cfg.rewards["roulade_landing_composite"] = RewardTermCfg(
         func=microduck_mdp.roulade_landing_composite,
         weight=4.0,
@@ -284,12 +304,12 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # composite product is ≈0): linear upright + broad height Gaussian.
     cfg.rewards["roulade_upright_after_roll"] = RewardTermCfg(
         func=microduck_mdp.roulade_upright_after_roll,
-        weight=0.75,
+        weight=1.5,
         params={"gate_lo": LANDING_GATE_LO, "gate_hi": LANDING_GATE_HI},
     )
     cfg.rewards["roulade_height_after_roll"] = RewardTermCfg(
         func=microduck_mdp.roulade_height_after_roll,
-        weight=0.5,
+        weight=1.0,
         params={
             "target_height": STAND_Z,
             "std":           0.04,
@@ -321,9 +341,12 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # broke standup's static-sit basin (its height L1 at ÷4-scaled weight
     # 7.5). Gate closed during the roll, so the roll itself is never taxed;
     # mid/late-roll spawns are born with it active, which is the point.
+    # Start near the effective magnitude of the old metre-valued tax.  The
+    # normalized full-strength tax is introduced only after the roll/recovery
+    # skill has had time to form (see the curriculum below).
     cfg.rewards["roulade_stand_tax"] = RewardTermCfg(
         func=microduck_mdp.roulade_stand_tax,
-        weight=2.0,
+        weight=0.25,
         params={
             "target_height": STAND_Z,
             "shortfall_scale": 0.02,
@@ -336,7 +359,7 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # this current-contact cost prevents keeping it planted afterwards.
     cfg.rewards["roulade_head_contact_after_roll"] = RewardTermCfg(
         func=microduck_mdp.roulade_head_contact_after_roll_penalty,
-        weight=-2.0,
+        weight=-0.25,
         params={
             "sensor_name": head_ground_cfg.name,
             "gate_lo": LANDING_GATE_LO,
@@ -384,6 +407,29 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "max_planar_speed": 0.08,
             "max_trunk_ang_vel": 0.35,
             "max_neck_speed": 0.75,
+            "gate_lo": LANDING_GATE_LO,
+            "gate_hi": LANDING_GATE_HI,
+            "target_overrides": None,
+        },
+    )
+
+    # Reachable stepping stone: getting onto two clean feet in a broadly
+    # correct pose is rewarded before the strict 7.5 mm / 15 deg / 0.25 rad
+    # target becomes attainable.  The strict bonus above remains twice as
+    # valuable and is what ultimately selects a settled HOME pose.
+    cfg.rewards["roulade_intermediate_standing"] = RewardTermCfg(
+        func=microduck_mdp.roulade_standing_success_bonus,
+        weight=2.0,
+        params={
+            "target_height": STAND_Z,
+            "height_tol": 0.015,
+            "upright_threshold": math.cos(math.radians(25.0)),
+            "pose_tol": 0.60,
+            "joint_indices": _LEG_JOINTS + _NECK_JOINTS,
+            "neck_joint_indices": _NECK_JOINTS,
+            "max_planar_speed": 0.25,
+            "max_trunk_ang_vel": 2.0,
+            "max_neck_speed": 3.0,
             "gate_lo": LANDING_GATE_LO,
             "gate_hi": LANDING_GATE_HI,
             "target_overrides": None,
@@ -746,6 +792,36 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 {"step": 0,          "weight": -0.1},
                 {"step": 1500 * 24,  "weight": -0.2},
                 {"step": 3000 * 24,  "weight": -0.4},
+            ],
+        },
+    )
+
+    # Stability costs are useful only after the dynamic skill exists.  At full
+    # strength from step zero they made crossing the completion gate worth
+    # roughly -5 episode reward in the failed run, while all clean-standing
+    # rewards stayed near zero.  This staged schedule preserves discovery,
+    # then progressively makes fast clean recovery preferable.
+    cfg.curriculum["roulade_stand_tax_weight"] = CurriculumTermCfg(
+        func=microduck_mdp.reward_weight,
+        params={
+            "reward_name": "roulade_stand_tax",
+            "weight_stages": [
+                {"step": 0,          "weight": 0.25},
+                {"step": 4000 * 24,  "weight": 0.5},
+                {"step": 6500 * 24,  "weight": 1.0},
+                {"step": 8500 * 24,  "weight": 2.0},
+            ],
+        },
+    )
+    cfg.curriculum["roulade_head_contact_weight"] = CurriculumTermCfg(
+        func=microduck_mdp.reward_weight,
+        params={
+            "reward_name": "roulade_head_contact_after_roll",
+            "weight_stages": [
+                {"step": 0,          "weight": -0.25},
+                {"step": 4000 * 24,  "weight": -0.5},
+                {"step": 6500 * 24,  "weight": -1.0},
+                {"step": 8500 * 24,  "weight": -2.0},
             ],
         },
     )

@@ -7045,6 +7045,42 @@ def roulade_landing_composite(
     return score * _roulade_clean_stand_gate(env, gate_lo, gate_hi)
 
 
+def roulade_recovery_composite(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    height_std: float,
+    upright_std: float,
+    pose_std: float,
+    joint_indices: list,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    target_overrides: Optional[dict] = None,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Broad standing score throughout post-roll recovery.
+
+    Unlike :func:`roulade_landing_composite`, this bridge intentionally does
+    not require both feet down or the head to be clear.  Those are final-state
+    conditions: using them on every positive standing term creates a reward
+    cliff in which a low/head-supported policy is penalized immediately after
+    completion but receives no gradient telling it how to rise.  The clean
+    landing terms remain more valuable and therefore still define the goal.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_roulade_accum(env, asset)
+    score = standing_composite_score(
+        env,
+        target_height=target_height,
+        height_std=height_std,
+        upright_std=upright_std,
+        pose_std=pose_std,
+        joint_indices=joint_indices,
+        target_overrides=target_overrides,
+        asset_cfg=asset_cfg,
+    )
+    return score * _roulade_completion_gate(env, gate_lo, gate_hi, require_head=True)
+
+
 def roulade_upright_after_roll(
     env: ManagerBasedRlEnv,
     gate_lo: float = math.radians(260.0),
