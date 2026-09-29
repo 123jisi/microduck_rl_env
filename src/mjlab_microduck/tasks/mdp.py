@@ -6639,6 +6639,7 @@ def trunk_upward_velocity_penalty(
 #   env._roulade_max        — max(accum) so far this episode (progress frontier)
 #   env._roulade_paid       — frontier already paid out by roulade_progress
 #   env._roulade_head_latch — True once the head touched ground mid-first-quadrant
+#   env._roulade_completion_step — first control step at/above the full-roll gate
 
 # Forward-roll sign: face-down is +90° pitch = rotation about body +y
 # (set_random_ground_state convention), so forward roll = POSITIVE body-frame
@@ -6744,11 +6745,19 @@ def _roulade_state(env: ManagerBasedRlEnv) -> tuple:
         env._roulade_head_latch_paid = torch.zeros(
             env.num_envs, dtype=torch.bool, device=env.device
         )
-        env._roulade_last_update_step = -1
-    elif not hasattr(env, "_roulade_head_latch_paid"):
-        env._roulade_head_latch_paid = torch.zeros(
-            env.num_envs, dtype=torch.bool, device=env.device
+        env._roulade_completion_step = torch.full(
+            (env.num_envs,), -1, dtype=torch.long, device=env.device
         )
+        env._roulade_last_update_step = -1
+    else:
+        if not hasattr(env, "_roulade_head_latch_paid"):
+            env._roulade_head_latch_paid = torch.zeros(
+                env.num_envs, dtype=torch.bool, device=env.device
+            )
+        if not hasattr(env, "_roulade_completion_step"):
+            env._roulade_completion_step = torch.full(
+                (env.num_envs,), -1, dtype=torch.long, device=env.device
+            )
     return env._roulade_accum, env._roulade_max, env._roulade_paid
 
 
@@ -6817,6 +6826,70 @@ def _roulade_completion_gate(
     return gate
 
 
+def _roulade_settle_scale_from_age(
+    age_s: torch.Tensor,
+    balance_grace_s: float,
+    settle_ramp_s: float,
+    initial_scale: float,
+) -> torch.Tensor:
+    """Scale final stillness rewards after a short balance-recovery window.
+
+    ``age_s < 0`` means the full-roll threshold has not been crossed and must
+    receive no final-standing reward. Once completed, a small reward remains
+    available during ``balance_grace_s`` so an already-good landing is still
+    preferable, but lifting a foot for one or two corrective steps is cheap.
+    The full clean-support/stillness objective then returns smoothly over
+    ``settle_ramp_s``; indefinite shuffling therefore loses the large annuity.
+    """
+    initial = float(min(max(initial_scale, 0.0), 1.0))
+    grace = max(balance_grace_s, 0.0)
+    ramp = max(settle_ramp_s, 0.0)
+    if ramp <= 0.0:
+        progress = (age_s >= grace).float()
+    else:
+        progress = torch.clamp((age_s - grace) / ramp, 0.0, 1.0)
+        progress = progress * progress * (3.0 - 2.0 * progress)
+    scale = initial + (1.0 - initial) * progress
+    return torch.where(age_s >= 0.0, scale, torch.zeros_like(scale))
+
+
+def _roulade_post_completion_settle_scale(
+    env: ManagerBasedRlEnv,
+    completion_angle: float,
+    balance_grace_s: float,
+    settle_ramp_s: float,
+    initial_scale: float,
+) -> torch.Tensor:
+    """Latch full completion time and return the final-standing reward scale.
+
+    This clock starts only after the authentic head latch and full completion
+    angle. It deliberately differs from the broad 260°→330° recovery gate:
+    opening final clean-support rewards in that interval taught the policy to
+    freeze around 326° instead of finishing and then correcting its balance.
+    """
+    _, max_accum, _ = _roulade_state(env)
+    step = int(env.common_step_counter)
+    completed = (max_accum >= completion_angle) & env._roulade_head_latch
+    newly_completed = completed & (env._roulade_completion_step < 0)
+    env._roulade_completion_step = torch.where(
+        newly_completed,
+        torch.full_like(env._roulade_completion_step, step),
+        env._roulade_completion_step,
+    )
+    age_steps = torch.where(
+        env._roulade_completion_step >= 0,
+        step - env._roulade_completion_step,
+        torch.full_like(env._roulade_completion_step, -1),
+    )
+    age_s = age_steps.float() * env.step_dt
+    return _roulade_settle_scale_from_age(
+        age_s,
+        balance_grace_s=balance_grace_s,
+        settle_ramp_s=settle_ramp_s,
+        initial_scale=initial_scale,
+    )
+
+
 def _roulade_clean_stand_gate_from_contacts(
     completion_gate: torch.Tensor,
     feet_contact: torch.Tensor,
@@ -6832,16 +6905,28 @@ def _roulade_clean_stand_gate(
     env: ManagerBasedRlEnv,
     gate_lo: float,
     gate_hi: float,
+    balance_grace_s: float = 0.0,
+    settle_ramp_s: float = 0.0,
+    initial_settle_scale: float = 1.0,
     feet_sensor_name: str = "feet_ground_contact",
     head_sensor_name: str = "head_ground_contact",
 ) -> torch.Tensor:
-    """Completion gate restricted to current clean two-foot support.
+    """Full-completion settle ramp restricted to clean two-foot support.
 
     The historical head latch proves that a real roll happened. It says
     nothing about the current support state, so the landing annuity needs a
-    separate check for two feet down and the head currently clear.
+    separate check for two feet down and the head currently clear. ``gate_lo``
+    remains part of the shared reward API, but final rewards deliberately wait
+    for ``gate_hi``; broad recovery rewards own the interval between them.
     """
-    completion = _roulade_completion_gate(env, gate_lo, gate_hi, require_head=True)
+    _ = gate_lo
+    completion = _roulade_post_completion_settle_scale(
+        env,
+        completion_angle=gate_hi,
+        balance_grace_s=balance_grace_s,
+        settle_ramp_s=settle_ramp_s,
+        initial_scale=initial_settle_scale,
+    )
     if feet_sensor_name not in env.scene.sensors or head_sensor_name not in env.scene.sensors:
         return torch.zeros_like(completion)
     feet_found = env.scene.sensors[feet_sensor_name].data.found
@@ -6983,6 +7068,10 @@ def reset_roulade_state(
     env._roulade_head_latch[env_ids] = prelatched
     # Synthetic late-spawn latches must not collect the one-shot milestone.
     env._roulade_head_latch_paid[env_ids] = prelatched
+    # Late reverse-curriculum starts beyond the full-roll threshold still get
+    # their own balance window. The first final-standing reward call starts the
+    # clock; all other spawns remain unset until authentic full completion.
+    env._roulade_completion_step[env_ids] = -1
 
 
 def roulade_progress(
@@ -7126,16 +7215,19 @@ def roulade_landing_composite(
     joint_indices: list,
     gate_lo: float = math.radians(260.0),
     gate_hi: float = math.radians(330.0),
+    balance_grace_s: float = 0.0,
+    settle_ramp_s: float = 0.0,
+    initial_settle_scale: float = 1.0,
     target_overrides: Optional[dict] = None,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Standing composite paid only on clean two-foot, head-clear support.
 
-    The big annuity: once the roll is (nearly) complete, every step spent
-    standing at HOME pose pays — finishing on the feet and staying there
-    dominates every partial outcome. Zero before gate_lo of rotation, so the
-    standing spawn cannot farm it by doing nothing. Requiring current clean
-    support makes repeated one-foot shuffling strictly worse than settling.
+    The big annuity opens only after the roll crosses ``gate_hi``. It starts
+    weak during the balance grace window, then ramps to full strength, so a
+    few corrective steps are affordable but repeated shuffling loses reward.
+    The standing spawn cannot farm it because it never crosses the full-roll
+    frontier or earns the authentic head latch.
     """
     asset: Entity = env.scene[asset_cfg.name]
     _update_roulade_accum(env, asset)
@@ -7149,7 +7241,15 @@ def roulade_landing_composite(
         target_overrides=target_overrides,
         asset_cfg=asset_cfg,
     )
-    return score * _roulade_clean_stand_gate(env, gate_lo, gate_hi)
+    clean_stand = _roulade_clean_stand_gate(
+        env,
+        gate_lo,
+        gate_hi,
+        balance_grace_s,
+        settle_ramp_s,
+        initial_settle_scale,
+    )
+    return score * clean_stand
 
 
 def roulade_recovery_composite(
@@ -7234,6 +7334,9 @@ def roulade_landing_sharp(
     upright_std: float = 0.3,
     gate_lo: float = math.radians(260.0),
     gate_hi: float = math.radians(330.0),
+    balance_grace_s: float = 0.0,
+    settle_ramp_s: float = 0.0,
+    initial_settle_scale: float = 1.0,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Tight upright × height score on clean two-foot, head-clear support.
@@ -7253,7 +7356,14 @@ def roulade_landing_sharp(
         asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
     )
     height_g = torch.exp(-((z - target_height) / height_std) ** 2)
-    gate = _roulade_clean_stand_gate(env, gate_lo, gate_hi)
+    gate = _roulade_clean_stand_gate(
+        env,
+        gate_lo,
+        gate_hi,
+        balance_grace_s,
+        settle_ramp_s,
+        initial_settle_scale,
+    )
     return upright_g * height_g * gate
 
 
@@ -7315,6 +7425,9 @@ def roulade_settled_standing_score(
     neck_speed_std: float,
     gate_lo: float = math.radians(260.0),
     gate_hi: float = math.radians(330.0),
+    balance_grace_s: float = 0.0,
+    settle_ramp_s: float = 0.0,
+    initial_settle_scale: float = 1.0,
     target_overrides: Optional[dict] = None,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
@@ -7353,7 +7466,15 @@ def roulade_settled_standing_score(
         * torch.exp(-trunk_ang_vel_sq / (trunk_ang_vel_std * trunk_ang_vel_std))
         * torch.exp(-neck_vel_sq / (neck_speed_std * neck_speed_std))
     )
-    return pose_score * motion_score * _roulade_clean_stand_gate(env, gate_lo, gate_hi)
+    clean_stand = _roulade_clean_stand_gate(
+        env,
+        gate_lo,
+        gate_hi,
+        balance_grace_s,
+        settle_ramp_s,
+        initial_settle_scale,
+    )
+    return pose_score * motion_score * clean_stand
 
 
 def roulade_standing_success_bonus(
@@ -7369,6 +7490,9 @@ def roulade_standing_success_bonus(
     max_neck_speed: float,
     gate_lo: float = math.radians(260.0),
     gate_hi: float = math.radians(330.0),
+    balance_grace_s: float = 0.0,
+    settle_ramp_s: float = 0.0,
+    initial_settle_scale: float = 1.0,
     target_overrides: Optional[dict] = None,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
@@ -7400,7 +7524,15 @@ def roulade_standing_success_bonus(
         & (torch.nan_to_num(trunk_ang_vel, nan=float("inf")) <= max_trunk_ang_vel)
         & (torch.nan_to_num(neck_speed, nan=float("inf")) <= max_neck_speed)
     )
-    return pose_success * stable.float() * _roulade_clean_stand_gate(env, gate_lo, gate_hi)
+    clean_stand = _roulade_clean_stand_gate(
+        env,
+        gate_lo,
+        gate_hi,
+        balance_grace_s,
+        settle_ramp_s,
+        initial_settle_scale,
+    )
+    return pose_success * stable.float() * clean_stand
 
 
 def roulade_rise_velocity(

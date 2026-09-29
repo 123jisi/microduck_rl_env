@@ -115,6 +115,15 @@ LANDING_GATE_HI = math.radians(330.0)
 RISE_GATE_LO    = math.radians(180.0)
 RISE_GATE_HI    = math.radians(260.0)
 
+# A completed roll may leave the centre of mass outside the final support
+# polygon. Keep final two-foot/stillness rewards cheap for 0.35 s so the duck
+# can take one or two corrective steps, then restore them over 0.65 s. The
+# broad recovery stack stays active throughout; after 1.0 s the full annuity
+# makes continued shuffling strictly expensive.
+POSTROLL_BALANCE_GRACE_S = 0.35
+POSTROLL_SETTLE_RAMP_S = 0.65
+POSTROLL_INITIAL_SETTLE_SCALE = 0.10
+
 _LEG_JOINTS  = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
 _NECK_JOINTS = [5, 6, 7, 8]
 
@@ -226,6 +235,12 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             del cfg.rewards[name]
 
     # ── Rewards: roulade task set ─────────────────────────────────────────────
+    settle_gate_params = {
+        "balance_grace_s": POSTROLL_BALANCE_GRACE_S,
+        "settle_ramp_s": POSTROLL_SETTLE_RAMP_S,
+        "initial_settle_scale": POSTROLL_INITIAL_SETTLE_SCALE,
+    }
+
     # Progress increments — the one dense task signal during the roll. During
     # a 1.5 s roll it averages ~0.7/step; total payout per full roll from a
     # standing spawn ≈ weight × (episode steps it took) × mean ≈ weight × 50.
@@ -293,9 +308,10 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     )
 
     # Clean-support standing annuity — the dominant final-state attractor. It
-    # includes the neck/head joints and pays only with both feet down and the
-    # head clear. One or two recovery steps remain possible, but shuffling
-    # cannot farm the highest-value layer.
+    # stays closed through the 260°→330° recovery interval: the previous
+    # smooth gate paid almost the whole annuity near 326° and taught the duck
+    # to freeze before true completion. After 330° it starts at 10%, allowing
+    # corrective steps, then reaches full strength within one second.
     cfg.rewards["roulade_landing_composite"] = RewardTermCfg(
         func=microduck_mdp.roulade_landing_composite,
         weight=4.0,
@@ -308,6 +324,7 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "gate_lo":          LANDING_GATE_LO,
             "gate_hi":          LANDING_GATE_HI,
             "target_overrides": None,
+            **settle_gate_params,
         },
     )
 
@@ -343,6 +360,7 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "upright_std":   0.20,
             "gate_lo":       LANDING_GATE_LO,
             "gate_hi":       LANDING_GATE_HI,
+            **settle_gate_params,
         },
     )
 
@@ -399,6 +417,7 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "gate_lo": LANDING_GATE_LO,
             "gate_hi": LANDING_GATE_HI,
             "target_overrides": None,
+            **settle_gate_params,
         },
     )
 
@@ -421,6 +440,7 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "gate_lo": LANDING_GATE_LO,
             "gate_hi": LANDING_GATE_HI,
             "target_overrides": None,
+            **settle_gate_params,
         },
     )
 
@@ -444,6 +464,7 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "gate_lo": LANDING_GATE_LO,
             "gate_hi": LANDING_GATE_HI,
             "target_overrides": None,
+            **settle_gate_params,
         },
     )
 

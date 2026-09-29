@@ -5,6 +5,9 @@ import torch
 
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_roulade_env_cfg import (
+    POSTROLL_BALANCE_GRACE_S,
+    POSTROLL_INITIAL_SETTLE_SCALE,
+    POSTROLL_SETTLE_RAMP_S,
     make_microduck_roulade_env_cfg,
 )
 
@@ -133,6 +136,57 @@ def test_clean_stand_gate_requires_both_feet_and_current_head_clear():
         head_contact=torch.tensor([[False], [False], [True], [False]]),
     )
     assert gate.tolist() == [1.0, 0.0, 0.0, 0.0]
+
+
+def test_final_standing_waits_for_full_roll_then_ramps_after_balance_grace():
+    env = SimpleNamespace(
+        num_envs=3,
+        device=torch.device("cpu"),
+        step_dt=0.02,
+        common_step_counter=100,
+        _roulade_accum=torch.zeros(3),
+        _roulade_max=torch.tensor(
+            [math.radians(329.0), math.radians(330.0), math.radians(340.0)]
+        ),
+        _roulade_paid=torch.zeros(3),
+        _roulade_head_latch=torch.tensor([True, True, False]),
+        _roulade_head_latch_paid=torch.tensor([True, True, False]),
+        _roulade_completion_step=torch.full((3,), -1, dtype=torch.long),
+    )
+
+    at_completion = microduck_mdp._roulade_post_completion_settle_scale(
+        env,
+        completion_angle=math.radians(330.0),
+        balance_grace_s=POSTROLL_BALANCE_GRACE_S,
+        settle_ramp_s=POSTROLL_SETTLE_RAMP_S,
+        initial_scale=POSTROLL_INITIAL_SETTLE_SCALE,
+    )
+    assert torch.allclose(at_completion, torch.tensor([0.0, 0.1, 0.0]))
+
+    env.common_step_counter = 150  # 1.0 s after full completion.
+    after_ramp = microduck_mdp._roulade_post_completion_settle_scale(
+        env,
+        completion_angle=math.radians(330.0),
+        balance_grace_s=POSTROLL_BALANCE_GRACE_S,
+        settle_ramp_s=POSTROLL_SETTLE_RAMP_S,
+        initial_scale=POSTROLL_INITIAL_SETTLE_SCALE,
+    )
+    assert torch.allclose(after_ramp, torch.tensor([0.0, 1.0, 0.0]))
+
+
+def test_all_clean_standing_rewards_share_the_balance_window():
+    cfg = make_microduck_roulade_env_cfg()
+    for name in (
+        "roulade_landing_composite",
+        "roulade_landing_sharp",
+        "roulade_settled_standing",
+        "roulade_standing_success",
+        "roulade_intermediate_standing",
+    ):
+        params = cfg.rewards[name].params
+        assert params["balance_grace_s"] == POSTROLL_BALANCE_GRACE_S
+        assert params["settle_ramp_s"] == POSTROLL_SETTLE_RAMP_S
+        assert params["initial_settle_scale"] == POSTROLL_INITIAL_SETTLE_SCALE
 
 
 def test_final_pose_and_stability_terms_include_neck():
@@ -304,7 +358,7 @@ def test_settled_score_has_gradient_from_current_wobbling_policy(monkeypatch):
     monkeypatch.setattr(
         microduck_mdp,
         "_roulade_clean_stand_gate",
-        lambda _env, _lo, _hi: torch.ones(2),
+        lambda *_args, **_kwargs: torch.ones(2),
     )
     monkeypatch.setattr(
         microduck_mdp,
@@ -349,7 +403,7 @@ def test_strict_success_rejects_a_fast_two_foot_pass_through(monkeypatch):
     monkeypatch.setattr(
         microduck_mdp,
         "_roulade_clean_stand_gate",
-        lambda _env, _lo, _hi: torch.ones(2),
+        lambda *_args, **_kwargs: torch.ones(2),
     )
     monkeypatch.setattr(
         microduck_mdp,
