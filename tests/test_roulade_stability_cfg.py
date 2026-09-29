@@ -15,6 +15,7 @@ def test_cfg_has_postroll_stability_rewards():
         "roulade_recovery_composite",
         "roulade_landing_composite",
         "roulade_landing_sharp",
+        "roulade_head_latch",
         "roulade_stand_tax",
         "roulade_head_contact_after_roll",
         "roulade_settled_standing",
@@ -22,6 +23,100 @@ def test_cfg_has_postroll_stability_rewards():
         "roulade_intermediate_standing",
     ):
         assert name in cfg.rewards, name
+
+
+def test_head_top_alignment_is_continuous_and_strongly_rejects_face_plant():
+    score = microduck_mdp._head_top_alignment_score(
+        torch.tensor([0.6, 0.0, -0.3, -1.0])
+    )
+    assert torch.all(score[1:] > score[:-1])
+    assert torch.allclose(score, torch.tensor([0.04, 0.25, 0.4225, 1.0]))
+
+
+def test_reverse_curriculum_only_prelatches_spawns_past_head_window():
+    is_mid = torch.tensor([False, True, True, True])
+    pitch = torch.tensor(
+        [0.0, math.radians(90.0), math.radians(169.0), math.radians(171.0)]
+    )
+    prelatched = microduck_mdp._roulade_spawn_head_latch(is_mid, pitch)
+    assert prelatched.tolist() == [False, False, False, True]
+
+
+def test_head_latch_bonus_is_one_shot_and_rate_normalized(monkeypatch):
+    asset = SimpleNamespace()
+
+    class Scene:
+        def __getitem__(self, _name):
+            return asset
+
+    env = SimpleNamespace(
+        num_envs=2,
+        device=torch.device("cpu"),
+        scene=Scene(),
+        step_dt=0.02,
+        _roulade_accum=torch.zeros(2),
+        _roulade_max=torch.zeros(2),
+        _roulade_paid=torch.zeros(2),
+        _roulade_head_latch=torch.tensor([True, True]),
+        # Env 1 represents a synthetic late-spawn latch, already paid.
+        _roulade_head_latch_paid=torch.tensor([False, True]),
+    )
+    monkeypatch.setattr(microduck_mdp, "_update_roulade_accum", lambda _env, _asset: None)
+
+    first = microduck_mdp.roulade_head_latch_bonus(env)
+    second = microduck_mdp.roulade_head_latch_bonus(env)
+    assert first.tolist() == [50.0, 0.0]
+    assert second.tolist() == [0.0, 0.0]
+
+
+def test_precompletion_polish_terms_are_structurally_gated(monkeypatch):
+    asset = SimpleNamespace()
+
+    class Scene:
+        def __getitem__(self, _name):
+            return asset
+
+    env = SimpleNamespace(num_envs=2, device=torch.device("cpu"), scene=Scene())
+    monkeypatch.setattr(microduck_mdp, "_update_roulade_accum", lambda _env, _asset: None)
+    monkeypatch.setattr(
+        microduck_mdp,
+        "_roulade_completion_gate",
+        lambda *_args, **_kwargs: torch.tensor([0.0, 1.0]),
+    )
+    monkeypatch.setattr(
+        microduck_mdp,
+        "body_ang_vel_at_height",
+        lambda *_args, **_kwargs: torch.tensor([3.0, 3.0]),
+    )
+    result = microduck_mdp.roulade_arrival_damping(
+        env, height_low=0.09, height_high=0.11
+    )
+    assert result.tolist() == [0.0, 3.0]
+
+
+def test_cfg_uses_authentic_latch_bridge_and_completion_gated_polish():
+    cfg = make_microduck_roulade_env_cfg()
+    assert cfg.rewards["roulade_head_pivot"].weight == 1.0
+    assert cfg.rewards["roulade_head_latch"].weight == 2.0
+    assert cfg.rewards["roulade_head_latch"].func is microduck_mdp.roulade_head_latch_bonus
+    assert cfg.rewards["arrival_damping"].func is microduck_mdp.roulade_arrival_damping
+    assert (
+        cfg.rewards["joint_torque_rate_l2"].func
+        is microduck_mdp.roulade_joint_torque_rate_l2
+    )
+    assert (
+        cfg.rewards["gentle_landing"].func
+        is microduck_mdp.roulade_gentle_landing_penalty
+    )
+    spawn = cfg.events["set_roulade_state"].params
+    assert spawn["midroll_pitch_power"] == 2.0
+
+
+def test_action_rate_tightening_waits_until_after_discovery_horizon():
+    cfg = make_microduck_roulade_env_cfg()
+    stages = cfg.curriculum["action_rate_weight"].params["weight_stages"]
+    assert [stage["step"] for stage in stages] == [0, 6500 * 24, 8500 * 24]
+    assert [stage["weight"] for stage in stages] == [-0.1, -0.2, -0.3]
 
 
 def test_clean_stand_gate_requires_both_feet_and_current_head_clear():

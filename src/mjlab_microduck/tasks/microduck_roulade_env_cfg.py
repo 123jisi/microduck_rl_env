@@ -249,11 +249,12 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         params={"omega_max": 7.0},
     )
 
-    # Head-as-pivot shaping: contact × mid-roll window × forward-rate factor
-    # (the rate factor kills the "rest face-down with head on floor" farm).
+    # Head-as-pivot shaping: contact × mid-roll window × forward-rate factor ×
+    # continuous head-top alignment. The previous binary alignment paid a
+    # face-plant 30% but gave no direction toward the hard latch pose.
     cfg.rewards["roulade_head_pivot"] = RewardTermCfg(
         func=microduck_mdp.roulade_head_pivot,
-        weight=0.5,
+        weight=1.0,
         params={
             "sensor_name": head_ground_cfg.name,
             "angle_lo": math.radians(30.0),
@@ -279,6 +280,16 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "gate_hi":          LANDING_GATE_HI,
             "target_overrides": None,
         },
+    )
+
+    # Explicit bridge across the failure point seen in the 6000-iteration
+    # rollout: every standing-start episode contacted the head in the latch
+    # window, but none put the top of the head down. This pays once, only when
+    # the authentic latch is newly earned; late reverse-curriculum starts are
+    # pre-marked paid and cannot farm it.
+    cfg.rewards["roulade_head_latch"] = RewardTermCfg(
+        func=microduck_mdp.roulade_head_latch_bonus,
+        weight=2.0,
     )
 
     # Clean-support standing annuity — the dominant final-state attractor. It
@@ -476,7 +487,9 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # rate) — the standup timing lesson.
     cfg.rewards["action_rate_l2"] = RewardTermCfg(func=mdp.action_rate_l2, weight=-0.1)
     cfg.rewards["joint_torque_rate_l2"] = RewardTermCfg(
-        func=microduck_mdp.joint_torque_rate_l2, weight=0.0
+        func=microduck_mdp.roulade_joint_torque_rate_l2,
+        weight=0.0,
+        params={"gate_lo": LANDING_GATE_LO, "gate_hi": LANDING_GATE_HI},
     )
 
     cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("trunk_base",)
@@ -484,31 +497,38 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.rewards["angular_momentum"].weight = -0.001
     cfg.rewards.pop("soft_landing", None)
 
-    # Arrival damper — trunk ω_xy² gated on standing height AND low tilt, so
-    # the roll itself is never taxed; introduced at 0 and ramped by curriculum.
+    # Arrival damper — completion gate is structural, in addition to height and
+    # tilt. The old height/tilt-only gate was active at the initial upright
+    # pose, so its late curriculum ramp taxed the angular velocity needed to
+    # start the roll.
     cfg.rewards["arrival_damping"] = RewardTermCfg(
-        func=microduck_mdp.body_ang_vel_at_height,
+        func=microduck_mdp.roulade_arrival_damping,
         weight=0.0,
         params={
             "height_low":    0.09,
             "height_high":   0.11,
             "tilt_full_deg": 20.0,
             "tilt_zero_deg": 45.0,
+            "gate_lo":       LANDING_GATE_LO,
+            "gate_hi":       LANDING_GATE_HI,
             "asset_cfg":     SceneEntityCfg("robot", body_names=("trunk_base",)),
         },
     )
 
-    # |a_z| impact shaping — active from step 0 (run-2 change: run 1
-    # discovered a violent solution under zero impact cost and locked it in;
-    # discovery is easy in this env, so shaping the style from the start is
-    # the priority). Curriculum ramps it further.
+    # |a_z| impact shaping on the EXIT landing only. A whole-body roll must
+    # create vertical acceleration at the head pivot; charging for it before
+    # completion turns a style term into an attempt tax.
     # NOTE: trunk_vertical_accel_penalty is SELF-NEGATING (returns -|a_z|) →
     # POSITIVE weight (penalty sign convention; a negative weight here would
     # reward violence — caught in the run-2 smoke test, sum was positive).
     cfg.rewards["gentle_landing"] = RewardTermCfg(
-        func=microduck_mdp.trunk_vertical_accel_penalty,
+        func=microduck_mdp.roulade_gentle_landing_penalty,
         weight=0.002,
-        params={"asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",))},
+        params={
+            "gate_lo": LANDING_GATE_LO,
+            "gate_hi": LANDING_GATE_HI,
+            "asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",)),
+        },
     )
 
     # Self-collision — LIGHT: a tucked roll needs body-on-body contact
@@ -643,6 +663,10 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "forward_vel_range":  ROULADE_FORWARD_VEL_RANGE,
             "midroll_pitch_min":  MIDROLL_PITCH_MIN,
             "midroll_pitch_max":  MIDROLL_PITCH_MAX,
+            # Bias reverse-curriculum samples toward the head-pivot segment;
+            # late recovery starts remain present and are pre-latched only
+            # when they start beyond the real 170° latch opportunity.
+            "midroll_pitch_power": 2.0,
             "midroll_z_min":      0.05,
             "midroll_z_max":      0.10,
             "midroll_omega_range": MIDROLL_OMEGA_RANGE,
@@ -732,10 +756,9 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         del cfg.curriculum["terrain_levels"]
     del cfg.curriculum["command_vel"]
 
-    # Reverse-curriculum mix: heavy mid-roll early (the completion sub-task is
-    # learnable from day 0 — it overlaps face-up recovery), shift toward
-    # standing starts as the full roll gets discovered. Mid-roll never goes to
-    # zero: it keeps the second half practiced and is realistic DR anyway.
+    # Reverse-curriculum mix: keep both authentic early head-pivot starts and
+    # late recovery starts, then gradually remove the early-angle sampling bias
+    # as standing-start rolls take over. Mid-roll never goes to zero.
     # Run-3: stages pushed 1500/3000 → 3000/6000 — run 2 shifted away from
     # mid-roll BEFORE standing-spawn rolls were mastered (progress episode-sum
     # was ~20% of a full roll at iter 1876; curriculum-pacing failure, same
@@ -745,9 +768,30 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         params={
             "event_name": "set_roulade_state",
             "param_stages": [
-                {"step": 0,          "params": {"standing_prob": 0.50, "midroll_prob": 0.50}},
-                {"step": 3000 * 24,  "params": {"standing_prob": 0.65, "midroll_prob": 0.35}},
-                {"step": 6000 * 24,  "params": {"standing_prob": 0.80, "midroll_prob": 0.20}},
+                {
+                    "step": 0,
+                    "params": {
+                        "standing_prob": 0.50,
+                        "midroll_prob": 0.50,
+                        "midroll_pitch_power": 2.0,
+                    },
+                },
+                {
+                    "step": 3000 * 24,
+                    "params": {
+                        "standing_prob": 0.60,
+                        "midroll_prob": 0.40,
+                        "midroll_pitch_power": 1.5,
+                    },
+                },
+                {
+                    "step": 6000 * 24,
+                    "params": {
+                        "standing_prob": 0.75,
+                        "midroll_prob": 0.25,
+                        "midroll_pitch_power": 1.0,
+                    },
+                },
             ],
         },
     )
@@ -779,19 +823,18 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             },
         )
 
-    # action_rate ramp — run-4: ceiling softened -0.6 → -0.4 and the -0.4
-    # stage pushed 2000 → 3000. Run-3's landing metrics peaked at ~iter 2700
-    # then declined, tracking the -0.4/-0.6 stages — the tightening was
-    # squeezing the rise. (Run-2 note still holds: -0.1 minimum from step 0,
-    # run 1 bred violence under near-zero smoothing.)
+    # Keep the only remaining pre-completion smoothness cost at its discovery
+    # floor through the 6000-iteration horizon. Earlier runs tightened it at
+    # 1500/3000 even though standing-start completion was still 0%, making the
+    # already-unlearned head transition progressively less attractive.
     cfg.curriculum["action_rate_weight"] = CurriculumTermCfg(
         func=microduck_mdp.reward_weight,
         params={
             "reward_name":   "action_rate_l2",
             "weight_stages": [
                 {"step": 0,          "weight": -0.1},
-                {"step": 1500 * 24,  "weight": -0.2},
-                {"step": 3000 * 24,  "weight": -0.4},
+                {"step": 6500 * 24,  "weight": -0.2},
+                {"step": 8500 * 24,  "weight": -0.3},
             ],
         },
     )

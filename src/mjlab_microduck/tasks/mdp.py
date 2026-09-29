@@ -6684,8 +6684,8 @@ def _lateral_axis_z(quat: torch.Tensor) -> torch.Tensor:
     return 2.0 * (quat[:, 2] * quat[:, 3] + quat[:, 0] * quat[:, 1])
 
 
-def _head_top_down(env: ManagerBasedRlEnv, asset: Entity) -> torch.Tensor:
-    """True where the head-top axis points at the floor (dot with -z > min)."""
+def _head_top_axis_world_z(env: ManagerBasedRlEnv, asset: Entity) -> torch.Tensor:
+    """World-z component of the head-top axis (-1 = squarely into floor)."""
     if not hasattr(env, "_roulade_head_body_id"):
         ids, _ = asset.find_bodies("jaw_soft")
         env._roulade_head_body_id = ids[0]
@@ -6693,10 +6693,38 @@ def _head_top_down(env: ManagerBasedRlEnv, asset: Entity) -> torch.Tensor:
     w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
     a, b, c = _HEAD_TOP_AXIS
     # z-component of R(q) @ axis_local
-    axis_world_z = (
+    return (
         2.0 * (x * z - w * y) * a + 2.0 * (y * z + w * x) * b + (1.0 - 2.0 * (x * x + y * y)) * c
     )
-    return axis_world_z < -_HEAD_TOP_DOWN_MIN
+
+
+def _head_top_alignment_score(axis_world_z: torch.Tensor) -> torch.Tensor:
+    """Continuous head-top alignment in [0, 1].
+
+    A binary ``top_down`` multiplier gave PPO no direction until the exact
+    latch pose had already been discovered.  Squared cosine alignment keeps a
+    small gradient at the measured face-plant (axis_z ~= +0.6 -> 0.04), while
+    making the desired head-top contact (axis_z ~= -1 -> 1.0) overwhelmingly
+    more valuable.
+    """
+    cosine_alignment = torch.clamp((1.0 - axis_world_z) * 0.5, 0.0, 1.0)
+    return cosine_alignment.square()
+
+
+def _head_top_down(env: ManagerBasedRlEnv, asset: Entity) -> torch.Tensor:
+    """True where the head-top axis points at the floor (dot with -z > min)."""
+    return _head_top_axis_world_z(env, asset) < -_HEAD_TOP_DOWN_MIN
+
+
+def _roulade_spawn_head_latch(is_mid: torch.Tensor, mid_pitch: torch.Tensor) -> torch.Tensor:
+    """Pre-latch only spawns that begin after the real latch opportunity.
+
+    Early mid-roll resets still have the physical opportunity to contact the
+    top of the head inside the latch window and therefore must earn the latch.
+    Treating every reverse-curriculum spawn as already latched silently taught
+    only the recovery half of the task and bypassed the key head-pivot skill.
+    """
+    return is_mid & (mid_pitch >= _HEAD_LATCH_HI)
 
 
 def _sensor_any_contact(env: ManagerBasedRlEnv, name: str) -> torch.Tensor | None:
@@ -6713,7 +6741,14 @@ def _roulade_state(env: ManagerBasedRlEnv) -> tuple:
         env._roulade_max = z.clone()
         env._roulade_paid = z.clone()
         env._roulade_head_latch = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._roulade_head_latch_paid = torch.zeros(
+            env.num_envs, dtype=torch.bool, device=env.device
+        )
         env._roulade_last_update_step = -1
+    elif not hasattr(env, "_roulade_head_latch_paid"):
+        env._roulade_head_latch_paid = torch.zeros(
+            env.num_envs, dtype=torch.bool, device=env.device
+        )
     return env._roulade_accum, env._roulade_max, env._roulade_paid
 
 
@@ -6826,6 +6861,7 @@ def reset_roulade_state(
     forward_vel_range: tuple = (0.0, 0.0),
     midroll_pitch_min: float = math.radians(50.0),
     midroll_pitch_max: float = math.radians(185.0),
+    midroll_pitch_power: float = 1.0,
     midroll_z_min: float = 0.05,
     midroll_z_max: float = 0.10,
     midroll_omega_range: tuple = (0.0, 0.0),
@@ -6847,7 +6883,9 @@ def reset_roulade_state(
     optional forward angular momentum from ``midroll_omega_range``. The
     rotation accumulator is initialized to the spawn pitch so progress
     accounting (and the completion gates) stay consistent: a 170° spawn only
-    gets paid for the remaining ~190°.
+    gets paid for the remaining ~190°. ``midroll_pitch_power > 1`` biases the
+    reverse curriculum toward the difficult early/head-pivot segment without
+    removing late recovery starts.
     """
     if env_ids is None or len(env_ids) == 0:
         return
@@ -6865,10 +6903,8 @@ def reset_roulade_state(
 
     # Pitch per bucket: small noise for standing, mid-roll angle otherwise.
     pitch = (torch.rand(num, device=env.device) * 2 - 1) * standing_tilt_max
-    mid_pitch = (
-        torch.rand(num, device=env.device) * (midroll_pitch_max - midroll_pitch_min)
-        + midroll_pitch_min
-    )
+    pitch_u = torch.rand(num, device=env.device).pow(max(midroll_pitch_power, 1e-6))
+    mid_pitch = pitch_u * (midroll_pitch_max - midroll_pitch_min) + midroll_pitch_min
     pitch = torch.where(is_mid, mid_pitch, pitch)
     roll = (torch.rand(num, device=env.device) * 2 - 1) * max(standing_tilt_max, math.radians(5.0))
 
@@ -6940,11 +6976,13 @@ def reset_roulade_state(
     accum[env_ids] = spawn_angle
     max_accum[env_ids] = spawn_angle
     paid[env_ids] = spawn_angle
-    # Head latch: mid-roll spawns are considered already past the head phase
-    # (the reverse curriculum teaches roll COMPLETION; requiring a latch they
-    # never had the chance to earn would keep their landing gate shut forever).
-    # Standing spawns must earn it by actually rolling over the head.
-    env._roulade_head_latch[env_ids] = is_mid
+    # Only late mid-roll spawns (already beyond the latch window) receive a
+    # synthetic latch so they can keep training recovery. Early mid-roll
+    # spawns must make authentic head-top contact, exactly like standing ones.
+    prelatched = _roulade_spawn_head_latch(is_mid, mid_pitch)
+    env._roulade_head_latch[env_ids] = prelatched
+    # Synthetic late-spawn latches must not collect the one-shot milestone.
+    env._roulade_head_latch_paid[env_ids] = prelatched
 
 
 def roulade_progress(
@@ -6987,12 +7025,13 @@ def roulade_head_pivot(
     """Reward head-ground contact while rotating forward mid-roll.
 
     contact × window(accum ∈ [angle_lo, angle_hi]) × clamp(ω_fwd/rate_norm, 0, 1)
-    × (0.3 + 0.7·top_down).
+    × continuous_head_top_alignment.
     The rate factor is the anti-camping guard: a face-planted robot resting its
     head on the floor has ω_fwd ≈ 0 and earns nothing — the term only pays for
-    pivoting OVER the head. The top_down factor (run-5) aligns this dense
-    shaping with the latch: any head contact mid-roll pays 30%, contact on the
-    FLAT TOP (chin tucked) pays full — the gradient that teaches the tuck.
+    pivoting OVER the head. The continuous orientation factor aligns this dense
+    shaping with the latch while retaining a gradient before the hard latch
+    threshold is reached. A measured face-plant pays only 4%; square head-top
+    contact pays 100%.
     """
     asset: Entity = env.scene[asset_cfg.name]
     _update_roulade_accum(env, asset)
@@ -7006,8 +7045,76 @@ def roulade_head_pivot(
     in_window = ((accum > angle_lo) & (accum < angle_hi)).float()
     omega_fwd = _ROULADE_FWD_SIGN * asset.data.root_link_ang_vel_b[:, 1]
     rate = torch.clamp(torch.nan_to_num(omega_fwd, nan=0.0) / rate_norm, 0.0, 1.0)
-    top = 0.3 + 0.7 * _head_top_down(env, asset).float()
+    top = _head_top_alignment_score(_head_top_axis_world_z(env, asset))
     return contact * in_window * rate * top
+
+
+def roulade_head_latch_bonus(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """One-shot reward when an authentic head-top pivot first latches.
+
+    The division by ``step_dt`` makes the configured weight the total milestone
+    payout after RewardManager's dt scaling. Pre-latched late curriculum spawns
+    are marked paid at reset and cannot collect it for free.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_roulade_accum(env, asset)
+    _roulade_state(env)
+    newly_latched = env._roulade_head_latch & ~env._roulade_head_latch_paid
+    env._roulade_head_latch_paid = env._roulade_head_latch_paid | env._roulade_head_latch
+    return newly_latched.float() / env.step_dt
+
+
+def roulade_arrival_damping(
+    env: ManagerBasedRlEnv,
+    height_low: float,
+    height_high: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    tilt_full_deg: float | None = None,
+    tilt_zero_deg: float = 45.0,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+) -> torch.Tensor:
+    """Arrival damping that is structurally impossible before roll completion."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_roulade_accum(env, asset)
+    cost = body_ang_vel_at_height(
+        env,
+        height_low=height_low,
+        height_high=height_high,
+        asset_cfg=asset_cfg,
+        tilt_full_deg=tilt_full_deg,
+        tilt_zero_deg=tilt_zero_deg,
+    )
+    return cost * _roulade_completion_gate(env, gate_lo, gate_hi, require_head=True)
+
+
+def roulade_joint_torque_rate_l2(
+    env: ManagerBasedRlEnv,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Torque-rate polish applied only after an authentic completed roll."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_roulade_accum(env, asset)
+    cost = joint_torque_rate_l2(env, asset_cfg=asset_cfg)
+    return cost * _roulade_completion_gate(env, gate_lo, gate_hi, require_head=True)
+
+
+def roulade_gentle_landing_penalty(
+    env: ManagerBasedRlEnv,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Self-negating vertical-impact cost restricted to the exit/landing."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_roulade_accum(env, asset)
+    penalty = trunk_vertical_accel_penalty(env, asset_cfg=asset_cfg)
+    return penalty * _roulade_completion_gate(env, gate_lo, gate_hi, require_head=True)
 
 
 def roulade_landing_composite(
