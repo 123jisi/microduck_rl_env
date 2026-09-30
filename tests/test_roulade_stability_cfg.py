@@ -7,7 +7,9 @@ from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_roulade_env_cfg import (
     POSTROLL_BALANCE_GRACE_S,
     POSTROLL_INITIAL_SETTLE_SCALE,
+    POSTROLL_RECOVERY_PROB,
     POSTROLL_SETTLE_RAMP_S,
+    POSTROLL_STEP_WINDOW_S,
     make_microduck_roulade_env_cfg,
 )
 
@@ -16,7 +18,9 @@ def test_cfg_has_postroll_stability_rewards():
     cfg = make_microduck_roulade_env_cfg()
     for name in (
         "roulade_recovery_composite",
+        "roulade_recovery_step",
         "roulade_landing_composite",
+        "roulade_natural_stance",
         "roulade_landing_sharp",
         "roulade_head_latch",
         "roulade_stand_tax",
@@ -43,6 +47,18 @@ def test_reverse_curriculum_only_prelatches_spawns_past_head_window():
     )
     prelatched = microduck_mdp._roulade_spawn_head_latch(is_mid, pitch)
     assert prelatched.tolist() == [False, False, False, True]
+
+
+def test_reverse_curriculum_has_a_distinct_postroll_recovery_bucket():
+    standing, midroll, recovery = microduck_mdp._roulade_spawn_masks(
+        torch.tensor([0.10, 0.50, 0.95]),
+        standing_prob=0.45,
+        midroll_prob=0.45,
+        recovery_prob=0.10,
+    )
+    assert standing.tolist() == [True, False, False]
+    assert midroll.tolist() == [False, True, False]
+    assert recovery.tolist() == [False, False, True]
 
 
 def test_head_latch_bonus_is_one_shot_and_rate_normalized(monkeypatch):
@@ -113,6 +129,8 @@ def test_cfg_uses_authentic_latch_bridge_and_completion_gated_polish():
     )
     spawn = cfg.events["set_roulade_state"].params
     assert spawn["midroll_pitch_power"] == 2.0
+    assert spawn["recovery_prob"] == POSTROLL_RECOVERY_PROB
+    assert spawn["recovery_forward_speed_range"][0] > 0.0
 
 
 def test_action_rate_tightening_waits_until_after_discovery_horizon():
@@ -120,6 +138,19 @@ def test_action_rate_tightening_waits_until_after_discovery_horizon():
     stages = cfg.curriculum["action_rate_weight"].params["weight_stages"]
     assert [stage["step"] for stage in stages] == [0, 6500 * 24, 8500 * 24]
     assert [stage["weight"] for stage in stages] == [-0.1, -0.2, -0.3]
+
+
+def test_spawn_curriculum_preserves_recovery_practice_without_dominating():
+    cfg = make_microduck_roulade_env_cfg()
+    stages = cfg.curriculum["roulade_spawn_mix"].params["param_stages"]
+    for stage in stages:
+        params = stage["params"]
+        assert params["recovery_prob"] == POSTROLL_RECOVERY_PROB
+        assert math.isclose(
+            params["standing_prob"] + params["midroll_prob"] + params["recovery_prob"],
+            1.0,
+        )
+    assert stages[-1]["params"]["standing_prob"] > stages[-1]["params"]["midroll_prob"]
 
 
 def test_clean_stand_gate_requires_both_feet_and_current_head_clear():
@@ -161,9 +192,9 @@ def test_final_standing_waits_for_full_roll_then_ramps_after_balance_grace():
         settle_ramp_s=POSTROLL_SETTLE_RAMP_S,
         initial_scale=POSTROLL_INITIAL_SETTLE_SCALE,
     )
-    assert torch.allclose(at_completion, torch.tensor([0.0, 0.1, 0.0]))
+    assert torch.allclose(at_completion, torch.tensor([0.0, 0.0, 0.0]))
 
-    env.common_step_counter = 150  # 1.0 s after full completion.
+    env.common_step_counter = 160  # 1.2 s after full completion.
     after_ramp = microduck_mdp._roulade_post_completion_settle_scale(
         env,
         completion_angle=math.radians(330.0),
@@ -178,6 +209,7 @@ def test_all_clean_standing_rewards_share_the_balance_window():
     cfg = make_microduck_roulade_env_cfg()
     for name in (
         "roulade_landing_composite",
+        "roulade_natural_stance",
         "roulade_landing_sharp",
         "roulade_settled_standing",
         "roulade_standing_success",
@@ -224,7 +256,10 @@ def test_landing_terms_use_clean_support_but_recovery_terms_stay_broad():
     )
     assert cfg.rewards["roulade_landing_composite"].func is microduck_mdp.roulade_landing_composite
     assert cfg.rewards["roulade_landing_sharp"].func is microduck_mdp.roulade_landing_sharp
-    assert cfg.rewards["roulade_upright_after_roll"].func is microduck_mdp.roulade_upright_after_roll
+    assert (
+        cfg.rewards["roulade_upright_after_roll"].func
+        is microduck_mdp.roulade_upright_after_roll
+    )
     assert cfg.rewards["roulade_height_after_roll"].func is microduck_mdp.roulade_height_after_roll
     assert cfg.rewards["roulade_upright_after_roll"].weight == 1.5
     assert cfg.rewards["roulade_height_after_roll"].weight == 1.0
@@ -334,6 +369,94 @@ def test_recovery_bridge_does_not_require_clean_support(monkeypatch):
         joint_indices=list(range(14)),
     )
     assert torch.allclose(result, torch.tensor([0.4, 0.1]))
+
+
+def test_recovery_step_reward_needs_imbalance_single_support_and_short_window(monkeypatch):
+    asset = SimpleNamespace(
+        data=SimpleNamespace(
+            root_link_lin_vel_w=torch.tensor(
+                [[0.20, 0.0, 0.0], [0.0, 0.0, 0.0], [0.20, 0.0, 0.0]]
+            ),
+            root_link_ang_vel_w=torch.zeros(3, 3),
+            root_link_quat_w=torch.tensor([[1.0, 0.0, 0.0, 0.0]] * 3),
+        )
+    )
+
+    class Scene:
+        def __init__(self):
+            self.sensors = {
+                "feet_ground_contact": SimpleNamespace(
+                    data=SimpleNamespace(found=torch.tensor([[1, 0], [1, 0], [1, 0]]))
+                ),
+                "head_ground_contact": SimpleNamespace(
+                    data=SimpleNamespace(found=torch.zeros(3, 1, dtype=torch.bool))
+                ),
+            }
+
+        def __getitem__(self, _name):
+            return asset
+
+    env = SimpleNamespace(num_envs=3, device=torch.device("cpu"), scene=Scene())
+    monkeypatch.setattr(microduck_mdp, "_update_roulade_accum", lambda *_args: None)
+    monkeypatch.setattr(
+        microduck_mdp,
+        "_roulade_post_completion_age_s",
+        lambda *_args: torch.tensor([0.20, 0.20, POSTROLL_STEP_WINDOW_S + 0.01]),
+    )
+    monkeypatch.setattr(microduck_mdp, "_servo_joint_pos", lambda *_args: torch.zeros(3, 14))
+    monkeypatch.setattr(
+        microduck_mdp, "_servo_default_joint_pos", lambda *_args: torch.zeros(3, 14)
+    )
+
+    reward = microduck_mdp.roulade_recovery_step_reward(
+        env,
+        joint_indices=[0, 1, 2, 3, 4, 9, 10, 11, 12, 13],
+        max_age_s=POSTROLL_STEP_WINDOW_S,
+        planar_speed_threshold=0.08,
+        planar_speed_width=0.16,
+        trunk_ang_vel_threshold=0.35,
+        trunk_ang_vel_width=0.70,
+        tilt_threshold=math.radians(8.0),
+        tilt_width=math.radians(12.0),
+        pose_error_threshold=0.18,
+        pose_error_width=0.25,
+    )
+    assert reward[0] > 0.0
+    assert reward[1] == 0.0
+    assert reward[2] == 0.0
+
+
+def test_natural_stance_score_has_separate_leg_and_neck_gradients(monkeypatch):
+    asset = SimpleNamespace()
+
+    class Scene:
+        def __getitem__(self, _name):
+            return asset
+
+    env = SimpleNamespace(num_envs=3, device=torch.device("cpu"), scene=Scene())
+    joint_pos = torch.zeros(3, 14)
+    joint_pos[1, [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]] = 0.18
+    joint_pos[2, [5, 6, 7, 8]] = 0.25
+    monkeypatch.setattr(microduck_mdp, "_update_roulade_accum", lambda *_args: None)
+    monkeypatch.setattr(microduck_mdp, "_servo_joint_pos", lambda *_args: joint_pos)
+    monkeypatch.setattr(
+        microduck_mdp, "_servo_default_joint_pos", lambda *_args: torch.zeros(3, 14)
+    )
+    monkeypatch.setattr(
+        microduck_mdp,
+        "_roulade_clean_stand_gate",
+        lambda *_args, **_kwargs: torch.ones(3),
+    )
+
+    score = microduck_mdp.roulade_natural_stance_score(
+        env,
+        leg_joint_indices=[0, 1, 2, 3, 4, 9, 10, 11, 12, 13],
+        neck_joint_indices=[5, 6, 7, 8],
+        leg_pose_std=0.18,
+        neck_pose_std=0.25,
+    )
+    expected = torch.tensor([1.0, math.exp(-1.0), math.exp(-1.0)])
+    assert torch.allclose(score, expected)
 
 
 def test_settled_score_has_gradient_from_current_wobbling_policy(monkeypatch):

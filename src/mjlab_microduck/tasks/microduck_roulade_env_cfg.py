@@ -116,13 +116,25 @@ RISE_GATE_LO    = math.radians(180.0)
 RISE_GATE_HI    = math.radians(260.0)
 
 # A completed roll may leave the centre of mass outside the final support
-# polygon. Keep final two-foot/stillness rewards cheap for 0.35 s so the duck
-# can take one or two corrective steps, then restore them over 0.65 s. The
-# broad recovery stack stays active throughout; after 1.0 s the full annuity
-# makes continued shuffling strictly expensive.
-POSTROLL_BALANCE_GRACE_S = 0.35
+# polygon. Turn the clean two-foot/stillness annuity fully off for 0.55 s (the
+# previous 10% floor still made freezing locally better than lifting a foot),
+# then restore it over 0.65 s. The broad recovery stack stays active throughout;
+# after 1.2 s the full annuity makes continued shuffling strictly expensive.
+POSTROLL_BALANCE_GRACE_S = 0.55
 POSTROLL_SETTLE_RAMP_S = 0.65
-POSTROLL_INITIAL_SETTLE_SCALE = 0.10
+POSTROLL_INITIAL_SETTLE_SCALE = 0.0
+POSTROLL_STEP_WINDOW_S = POSTROLL_BALANCE_GRACE_S + POSTROLL_SETTLE_RAMP_S
+
+# Ten percent of resets isolate the missing last-mile skill: the roll is marked
+# complete, but the near-standing robot still has realistic residual tilt,
+# velocity, and joint error. This is not a shortcut for standing-start episodes;
+# it is reverse curriculum for the catch step, analogous to mid-roll spawns.
+POSTROLL_RECOVERY_PROB = 0.10
+POSTROLL_RECOVERY_TILT_MAX = math.radians(12.0)
+POSTROLL_RECOVERY_FORWARD_SPEED_RANGE = (0.08, 0.25)
+POSTROLL_RECOVERY_LATERAL_SPEED_RANGE = (-0.08, 0.08)
+POSTROLL_RECOVERY_ANG_VEL_RANGE = (-1.2, 1.2)
+POSTROLL_RECOVERY_JOINT_NOISE_STD = 0.12
 
 _LEG_JOINTS  = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
 _NECK_JOINTS = [5, 6, 7, 8]
@@ -297,6 +309,29 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         },
     )
 
+    # A grace period only removes the cost of stepping; it does not make a
+    # catch step preferable to freezing. Reward single support briefly and
+    # only while residual motion/tilt/leg error says recovery is needed. The
+    # reward fades to zero exactly as the final two-foot annuity reaches full
+    # strength, so it cannot support continuous shuffling.
+    cfg.rewards["roulade_recovery_step"] = RewardTermCfg(
+        func=microduck_mdp.roulade_recovery_step_reward,
+        weight=0.75,
+        params={
+            "joint_indices": _LEG_JOINTS,
+            "max_age_s": POSTROLL_STEP_WINDOW_S,
+            "planar_speed_threshold": 0.08,
+            "planar_speed_width": 0.16,
+            "trunk_ang_vel_threshold": 0.35,
+            "trunk_ang_vel_width": 0.70,
+            "tilt_threshold": math.radians(8.0),
+            "tilt_width": math.radians(12.0),
+            "pose_error_threshold": 0.18,
+            "pose_error_width": 0.25,
+            "completion_angle": LANDING_GATE_HI,
+        },
+    )
+
     # Explicit bridge across the failure point seen in the 6000-iteration
     # rollout: every standing-start episode contacted the head in the latch
     # window, but none put the top of the head down. This pays once, only when
@@ -310,8 +345,8 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # Clean-support standing annuity — the dominant final-state attractor. It
     # stays closed through the 260°→330° recovery interval: the previous
     # smooth gate paid almost the whole annuity near 326° and taught the duck
-    # to freeze before true completion. After 330° it starts at 10%, allowing
-    # corrective steps, then reaches full strength within one second.
+    # to freeze before true completion. After 330° it stays off for the catch
+    # window, then reaches full strength at 1.2 seconds.
     cfg.rewards["roulade_landing_composite"] = RewardTermCfg(
         func=microduck_mdp.roulade_landing_composite,
         weight=4.0,
@@ -381,6 +416,25 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "shortfall_scale": 0.02,
             "gate_lo":       LANDING_GATE_LO,
             "gate_hi":       LANDING_GATE_HI,
+        },
+    )
+
+    # Last-mile pose gradient missing from the previous run: the broad 0.40-rad
+    # 14-joint average paid the photographed split-leg / parked-head pose well,
+    # while the strict max-joint HOME bonus stayed exactly zero. Split groups
+    # with tighter smooth widths reward a recovery step only if it ends closer
+    # to the same natural HOME pose used at episode start.
+    cfg.rewards["roulade_natural_stance"] = RewardTermCfg(
+        func=microduck_mdp.roulade_natural_stance_score,
+        weight=3.0,
+        params={
+            "leg_joint_indices": _LEG_JOINTS,
+            "neck_joint_indices": _NECK_JOINTS,
+            "leg_pose_std": 0.18,
+            "neck_pose_std": 0.25,
+            "gate_lo": LANDING_GATE_LO,
+            "gate_hi": LANDING_GATE_HI,
+            **settle_gate_params,
         },
     )
 
@@ -669,15 +723,16 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.events["foot_friction"].params["asset_cfg"].geom_names = foot_frictions_geom_names
     cfg.events["foot_friction"].params["ranges"] = (0.7, 1.3)
 
-    # Standing start + mid-roll reverse-curriculum spawns; also resets the
-    # rotation accumulator (must run after reset_robot_joints — dict insertion
-    # order — since mid-roll tuck lerps FROM the HOME pose it wrote).
+    # Standing start + mid-roll + completed-but-unbalanced recovery spawns;
+    # also resets the rotation accumulator (must run after reset_robot_joints —
+    # dict insertion order — since reset perturbations start from HOME).
     cfg.events["set_roulade_state"] = EventTermCfg(
         func=microduck_mdp.reset_roulade_state,
         mode="reset",
         params={
-            "standing_prob":      0.5,
-            "midroll_prob":       0.5,
+            "standing_prob":      0.45,
+            "midroll_prob":       0.45,
+            "recovery_prob":      POSTROLL_RECOVERY_PROB,
             "standing_z_min":     0.11,
             "standing_z_max":     0.12,
             "standing_tilt_max":  math.radians(5.0),
@@ -694,6 +749,11 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "tuck_overrides":     TUCK_OVERRIDES,
             "tuck_factor_range":  (0.3, 1.0),
             "joint_noise_std":    0.08,
+            "recovery_tilt_max": POSTROLL_RECOVERY_TILT_MAX,
+            "recovery_forward_speed_range": POSTROLL_RECOVERY_FORWARD_SPEED_RANGE,
+            "recovery_lateral_speed_range": POSTROLL_RECOVERY_LATERAL_SPEED_RANGE,
+            "recovery_ang_vel_range": POSTROLL_RECOVERY_ANG_VEL_RANGE,
+            "recovery_joint_noise_std": POSTROLL_RECOVERY_JOINT_NOISE_STD,
         },
     )
 
@@ -777,9 +837,10 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         del cfg.curriculum["terrain_levels"]
     del cfg.curriculum["command_vel"]
 
-    # Reverse-curriculum mix: keep both authentic early head-pivot starts and
-    # late recovery starts, then gradually remove the early-angle sampling bias
-    # as standing-start rolls take over. Mid-roll never goes to zero.
+    # Reverse-curriculum mix: keep authentic mid-roll starts plus a fixed 10%
+    # completed-but-unbalanced bucket, then gradually let real standing-start
+    # rolls take over. The recovery bucket never grows large enough to turn the
+    # task into generic push recovery, but every batch contains catch-step data.
     # Run-3: stages pushed 1500/3000 → 3000/6000 — run 2 shifted away from
     # mid-roll BEFORE standing-spawn rolls were mastered (progress episode-sum
     # was ~20% of a full roll at iter 1876; curriculum-pacing failure, same
@@ -792,24 +853,27 @@ def make_microduck_roulade_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 {
                     "step": 0,
                     "params": {
-                        "standing_prob": 0.50,
-                        "midroll_prob": 0.50,
+                        "standing_prob": 0.45,
+                        "midroll_prob": 0.45,
+                        "recovery_prob": POSTROLL_RECOVERY_PROB,
                         "midroll_pitch_power": 2.0,
                     },
                 },
                 {
                     "step": 3000 * 24,
                     "params": {
-                        "standing_prob": 0.60,
-                        "midroll_prob": 0.40,
+                        "standing_prob": 0.55,
+                        "midroll_prob": 0.35,
+                        "recovery_prob": POSTROLL_RECOVERY_PROB,
                         "midroll_pitch_power": 1.5,
                     },
                 },
                 {
                     "step": 6000 * 24,
                     "params": {
-                        "standing_prob": 0.75,
+                        "standing_prob": 0.65,
                         "midroll_prob": 0.25,
+                        "recovery_prob": POSTROLL_RECOVERY_PROB,
                         "midroll_pitch_power": 1.0,
                     },
                 },

@@ -4276,7 +4276,10 @@ def set_random_ground_state(
     # Random z per env: prone heights for face-down/up, low for sit, ~standing for stand.
     z_prone = torch.rand(num, device=env.device) * (prone_z_max - prone_z_min) + prone_z_min
     z_sit   = torch.rand(num, device=env.device) * (sitting_z_max - sitting_z_min) + sitting_z_min
-    z_stand = torch.rand(num, device=env.device) * (standing_z_max - standing_z_min) + standing_z_min
+    z_stand = (
+        torch.rand(num, device=env.device) * (standing_z_max - standing_z_min)
+        + standing_z_min
+    )
     new_z = z_prone.clone()
     new_z = torch.where(is_sit, z_sit, new_z)
     new_z = torch.where(is_stand, z_stand, new_z)
@@ -6728,6 +6731,33 @@ def _roulade_spawn_head_latch(is_mid: torch.Tensor, mid_pitch: torch.Tensor) -> 
     return is_mid & (mid_pitch >= _HEAD_LATCH_HI)
 
 
+def _roulade_spawn_masks(
+    sample: torch.Tensor,
+    standing_prob: float,
+    midroll_prob: float,
+    recovery_prob: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Partition reset samples into standing, mid-roll, and post-roll recovery.
+
+    The third bucket is distinct from a late mid-roll reset: it starts upright
+    but moving/tilted, with the roll already paid and latched. This supplies
+    dense practice for the catch-step state that follows a real roll instead
+    of relying on the whole-manoeuvre credit-assignment chain.
+    """
+    standing = max(float(standing_prob), 0.0)
+    midroll = max(float(midroll_prob), 0.0)
+    recovery = max(float(recovery_prob), 0.0)
+    total = standing + midroll + recovery
+    if total <= 0.0:
+        raise ValueError("At least one roulade spawn probability must be positive")
+
+    scaled = sample * total
+    is_standing = scaled < standing
+    is_mid = (scaled >= standing) & (scaled < standing + midroll)
+    is_recovery = ~(is_standing | is_mid)
+    return is_standing, is_mid, is_recovery
+
+
 def _sensor_any_contact(env: ManagerBasedRlEnv, name: str) -> torch.Tensor | None:
     if name not in env.scene.sensors:
         return None
@@ -6860,7 +6890,21 @@ def _roulade_post_completion_settle_scale(
     settle_ramp_s: float,
     initial_scale: float,
 ) -> torch.Tensor:
-    """Latch full completion time and return the final-standing reward scale.
+    """Latch full completion time and return the final-standing reward scale."""
+    age_s = _roulade_post_completion_age_s(env, completion_angle)
+    return _roulade_settle_scale_from_age(
+        age_s,
+        balance_grace_s=balance_grace_s,
+        settle_ramp_s=settle_ramp_s,
+        initial_scale=initial_scale,
+    )
+
+
+def _roulade_post_completion_age_s(
+    env: ManagerBasedRlEnv,
+    completion_angle: float,
+) -> torch.Tensor:
+    """Latch full completion and return seconds since it, or ``-1`` before it.
 
     This clock starts only after the authentic head latch and full completion
     angle. It deliberately differs from the broad 260°→330° recovery gate:
@@ -6881,13 +6925,7 @@ def _roulade_post_completion_settle_scale(
         step - env._roulade_completion_step,
         torch.full_like(env._roulade_completion_step, -1),
     )
-    age_s = age_steps.float() * env.step_dt
-    return _roulade_settle_scale_from_age(
-        age_s,
-        balance_grace_s=balance_grace_s,
-        settle_ramp_s=settle_ramp_s,
-        initial_scale=initial_scale,
-    )
+    return age_steps.float() * env.step_dt
 
 
 def _roulade_clean_stand_gate_from_contacts(
@@ -6940,6 +6978,7 @@ def reset_roulade_state(
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
     standing_prob: float = 0.5,
     midroll_prob: float = 0.5,
+    recovery_prob: float = 0.0,
     standing_z_min: float = 0.11,
     standing_z_max: float = 0.12,
     standing_tilt_max: float = 0.0,
@@ -6953,8 +6992,14 @@ def reset_roulade_state(
     tuck_overrides: Optional[dict] = None,
     tuck_factor_range: tuple = (0.3, 1.0),
     joint_noise_std: float = 0.0,
+    recovery_tilt_max: float = 0.0,
+    recovery_forward_speed_range: tuple = (0.0, 0.0),
+    recovery_lateral_speed_range: tuple = (0.0, 0.0),
+    recovery_ang_vel_range: tuple = (0.0, 0.0),
+    recovery_joint_noise_std: float = 0.0,
+    recovery_progress: float = 2 * math.pi,
 ):
-    """Reset to a standing start or a mid-roll state (reverse curriculum).
+    """Reset to standing, mid-roll, or post-roll recovery curriculum states.
 
     Standing bucket: upright (±standing_tilt_max pitch/roll noise), random yaw,
     HOME joints (left from reset_robot_joints), z in [standing_z_min, _max].
@@ -6971,6 +7016,12 @@ def reset_roulade_state(
     gets paid for the remaining ~190°. ``midroll_pitch_power > 1`` biases the
     reverse curriculum toward the difficult early/head-pivot segment without
     removing late recovery starts.
+
+    Recovery bucket: an already-completed, pre-latched roll that starts near
+    standing but with root tilt, residual planar/angular velocity, and joint
+    noise. It cannot collect free progress or latch bonuses. These starts teach
+    a short catch step and return to HOME; otherwise this state is seen only
+    after a full successful roll and is too sparse for a reliable skill.
     """
     if env_ids is None or len(env_ids) == 0:
         return
@@ -6979,8 +7030,12 @@ def reset_roulade_state(
     asset: Entity = env.scene[asset_cfg.name]
     accum, max_accum, paid = _roulade_state(env)
 
-    total = standing_prob + midroll_prob
-    is_mid = torch.rand(num, device=env.device) < (midroll_prob / max(total, 1e-6))
+    is_standing, is_mid, is_recovery = _roulade_spawn_masks(
+        torch.rand(num, device=env.device),
+        standing_prob=standing_prob,
+        midroll_prob=midroll_prob,
+        recovery_prob=recovery_prob,
+    )
 
     yaw = torch.rand(num, device=env.device) * 2 * np.pi - np.pi
     cy = torch.cos(yaw * 0.5)
@@ -6992,6 +7047,10 @@ def reset_roulade_state(
     mid_pitch = pitch_u * (midroll_pitch_max - midroll_pitch_min) + midroll_pitch_min
     pitch = torch.where(is_mid, mid_pitch, pitch)
     roll = (torch.rand(num, device=env.device) * 2 - 1) * max(standing_tilt_max, math.radians(5.0))
+    recovery_pitch = (torch.rand(num, device=env.device) * 2 - 1) * recovery_tilt_max
+    recovery_roll = (torch.rand(num, device=env.device) * 2 - 1) * recovery_tilt_max
+    pitch = torch.where(is_recovery, recovery_pitch, pitch)
+    roll = torch.where(is_recovery, recovery_roll, roll)
 
     cp = torch.cos(pitch * 0.5); sp = torch.sin(pitch * 0.5)
     cr = torch.cos(roll * 0.5); sr = torch.sin(roll * 0.5)
@@ -7031,6 +7090,15 @@ def reset_roulade_state(
         noise = torch.randn(len(mid_env_ids), len(cols), device=env.device) * joint_noise_std
         env.sim.data.qpos[mid_env_ids.unsqueeze(1), cols.unsqueeze(0)] += noise
 
+    recovery_env_ids = env_ids[is_recovery]
+    if len(recovery_env_ids) > 0 and recovery_joint_noise_std > 0.0:
+        cols = torch.tensor([7 + j for j in servo_ids], device=env.device, dtype=torch.long)
+        noise = (
+            torch.randn(len(recovery_env_ids), len(cols), device=env.device)
+            * recovery_joint_noise_std
+        )
+        env.sim.data.qpos[recovery_env_ids.unsqueeze(1), cols.unsqueeze(0)] += noise
+
     # Mid-roll forward angular momentum: rotation about body +y. MuJoCo free
     # joint qvel[3:6] is the angular velocity in the BODY frame, so [0, ω, 0]
     # is the forward-roll axis regardless of spawn yaw (verified in the smoke
@@ -7043,28 +7111,71 @@ def reset_roulade_state(
         )
         env.sim.data.qvel[mid_env_ids, 4] = _ROULADE_FWD_SIGN * omega
 
+    # Residual motion after a real roll is mostly sagittal. A smaller lateral
+    # component prevents the catch strategy from overfitting to one plane.
+    # Translational qvel is world-frame, so rotate sampled body-frame velocity
+    # through the randomized spawn yaw.
+    if len(recovery_env_ids) > 0:
+        count = len(recovery_env_ids)
+        speed_lo, speed_hi = recovery_forward_speed_range
+        forward_mag = (
+            torch.rand(count, device=env.device) * (speed_hi - speed_lo) + speed_lo
+        )
+        forward_sign = torch.where(
+            torch.rand(count, device=env.device) < 0.5,
+            -torch.ones(count, device=env.device),
+            torch.ones(count, device=env.device),
+        )
+        forward = forward_mag * forward_sign
+        lateral_lo, lateral_hi = recovery_lateral_speed_range
+        lateral = (
+            torch.rand(count, device=env.device) * (lateral_hi - lateral_lo)
+            + lateral_lo
+        )
+        yaw_r = yaw[is_recovery]
+        env.sim.data.qvel[recovery_env_ids, 0] = (
+            forward * torch.cos(yaw_r) - lateral * torch.sin(yaw_r)
+        )
+        env.sim.data.qvel[recovery_env_ids, 1] = (
+            forward * torch.sin(yaw_r) + lateral * torch.cos(yaw_r)
+        )
+
+        ang_lo, ang_hi = recovery_ang_vel_range
+        env.sim.data.qvel[recovery_env_ids, 3] = (
+            torch.rand(count, device=env.device) * (ang_hi - ang_lo) + ang_lo
+        )
+        env.sim.data.qvel[recovery_env_ids, 4] = (
+            torch.rand(count, device=env.device) * (ang_hi - ang_lo) + ang_lo
+        )
+
     # Élan hook: forward base velocity for STANDING spawns, body x → world xy
     # through the spawn yaw. (0, 0) = standstill start, disabled.
-    stand_env_ids = env_ids[~is_mid]
+    stand_env_ids = env_ids[is_standing]
     if len(stand_env_ids) > 0 and forward_vel_range[1] > 0.0:
         vx = (
             torch.rand(len(stand_env_ids), device=env.device)
             * (forward_vel_range[1] - forward_vel_range[0])
             + forward_vel_range[0]
         )
-        yaw_s = yaw[~is_mid]
+        yaw_s = yaw[is_standing]
         env.sim.data.qvel[stand_env_ids, 0] = vx * torch.cos(yaw_s)
         env.sim.data.qvel[stand_env_ids, 1] = vx * torch.sin(yaw_s)
 
-    # Progress accounting: standing starts at 0, mid-roll at the spawn pitch.
+    # Progress accounting: standing starts at 0, mid-roll at the spawn pitch,
+    # and recovery starts after the paid 2π frontier.
     spawn_angle = torch.where(is_mid, mid_pitch, torch.zeros_like(mid_pitch))
+    spawn_angle = torch.where(
+        is_recovery,
+        torch.full_like(spawn_angle, recovery_progress),
+        spawn_angle,
+    )
     accum[env_ids] = spawn_angle
     max_accum[env_ids] = spawn_angle
     paid[env_ids] = spawn_angle
     # Only late mid-roll spawns (already beyond the latch window) receive a
     # synthetic latch so they can keep training recovery. Early mid-roll
     # spawns must make authentic head-top contact, exactly like standing ones.
-    prelatched = _roulade_spawn_head_latch(is_mid, mid_pitch)
+    prelatched = _roulade_spawn_head_latch(is_mid, mid_pitch) | is_recovery
     env._roulade_head_latch[env_ids] = prelatched
     # Synthetic late-spawn latches must not collect the one-shot milestone.
     env._roulade_head_latch_paid[env_ids] = prelatched
@@ -7286,6 +7397,116 @@ def roulade_recovery_composite(
         asset_cfg=asset_cfg,
     )
     return score * _roulade_completion_gate(env, gate_lo, gate_hi, require_head=True)
+
+
+def roulade_recovery_step_reward(
+    env: ManagerBasedRlEnv,
+    joint_indices: list,
+    max_age_s: float,
+    planar_speed_threshold: float,
+    planar_speed_width: float,
+    trunk_ang_vel_threshold: float,
+    trunk_ang_vel_width: float,
+    tilt_threshold: float,
+    tilt_width: float,
+    pose_error_threshold: float,
+    pose_error_width: float,
+    completion_angle: float = math.radians(330.0),
+    feet_sensor_name: str = "feet_ground_contact",
+    head_sensor_name: str = "head_ground_contact",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Briefly reward single support when a completed roll is still unbalanced.
+
+    Merely lowering the two-foot annuity does not make a catch step better than
+    freezing; it only makes both choices cheaper. This term supplies that
+    missing local preference. It is active only during the short post-roll
+    window, only with exactly one foot down and the head clear, and only while
+    speed, tilt, angular speed, or leg HOME error says recovery is still needed.
+    A natural settled stand therefore gets zero, and the time gate prevents a
+    perpetual one-foot or shuffling solution.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_roulade_accum(env, asset)
+    age_s = _roulade_post_completion_age_s(env, completion_angle)
+
+    if feet_sensor_name not in env.scene.sensors or head_sensor_name not in env.scene.sensors:
+        return torch.zeros(env.num_envs, device=env.device)
+    feet_found = env.scene.sensors[feet_sensor_name].data.found
+    feet = feet_found.view(feet_found.shape[0], -1) > 0
+    single_support = feet.sum(dim=-1) == 1
+    head_found = env.scene.sensors[head_sensor_name].data.found
+    head_clear = ~(head_found.view(head_found.shape[0], -1) > 0).any(dim=-1)
+
+    planar_speed = torch.linalg.vector_norm(asset.data.root_link_lin_vel_w[:, :2], dim=-1)
+    trunk_ang_vel = torch.linalg.vector_norm(asset.data.root_link_ang_vel_w[:, :2], dim=-1)
+    quat = asset.data.root_link_quat_w
+    upright = torch.clamp(1.0 - 2.0 * (quat[:, 1].square() + quat[:, 2].square()), -1.0, 1.0)
+    tilt = torch.acos(upright)
+
+    joint_pos = _servo_joint_pos(env, asset)[:, joint_indices]
+    target = _servo_default_joint_pos(env, asset)[:, joint_indices]
+    pose_error = torch.sqrt((joint_pos - target).square().mean(dim=-1) + 1e-12)
+
+    def excess(value: torch.Tensor, threshold: float, width: float) -> torch.Tensor:
+        return torch.clamp((value - threshold) / max(width, 1e-6), 0.0, 1.0)
+
+    need = torch.maximum(
+        excess(planar_speed, planar_speed_threshold, planar_speed_width),
+        excess(trunk_ang_vel, trunk_ang_vel_threshold, trunk_ang_vel_width),
+    )
+    need = torch.maximum(need, excess(tilt, tilt_threshold, tilt_width))
+    need = torch.maximum(need, excess(pose_error, pose_error_threshold, pose_error_width))
+
+    time_gate = torch.where(
+        age_s >= 0.0,
+        torch.clamp(1.0 - age_s / max(max_age_s, 1e-6), 0.0, 1.0),
+        torch.zeros_like(age_s),
+    )
+    return single_support.float() * head_clear.float() * need * time_gate
+
+
+def roulade_natural_stance_score(
+    env: ManagerBasedRlEnv,
+    leg_joint_indices: list,
+    neck_joint_indices: list,
+    leg_pose_std: float,
+    neck_pose_std: float,
+    gate_lo: float = math.radians(260.0),
+    gate_hi: float = math.radians(330.0),
+    balance_grace_s: float = 0.0,
+    settle_ramp_s: float = 0.0,
+    initial_settle_scale: float = 1.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Tight, smooth HOME-pose attractor for the final natural stance.
+
+    The broad all-joint pose Gaussian deliberately helps early recovery, but it
+    averages 14 joints with a 0.40-rad width. A split leg/neck product makes a
+    visibly splayed leg or parked head expensive while retaining gradient where
+    the strict max-joint success bonus is identically zero.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_roulade_accum(env, asset)
+    joint_pos = _servo_joint_pos(env, asset)
+    target = _servo_default_joint_pos(env, asset)
+    leg_error_sq = (
+        joint_pos[:, leg_joint_indices] - target[:, leg_joint_indices]
+    ).square().mean(dim=-1)
+    neck_error_sq = (
+        joint_pos[:, neck_joint_indices] - target[:, neck_joint_indices]
+    ).square().mean(dim=-1)
+    pose_score = torch.exp(-leg_error_sq / (leg_pose_std * leg_pose_std))
+    pose_score *= torch.exp(-neck_error_sq / (neck_pose_std * neck_pose_std))
+    clean_stand = _roulade_clean_stand_gate(
+        env,
+        gate_lo,
+        gate_hi,
+        balance_grace_s,
+        settle_ramp_s,
+        initial_settle_scale,
+    )
+    return pose_score * clean_stand
 
 
 def roulade_upright_after_roll(
